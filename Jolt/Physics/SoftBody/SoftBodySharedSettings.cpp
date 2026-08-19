@@ -55,6 +55,8 @@ JPH_IMPLEMENT_SERIALIZABLE_NON_VIRTUAL(SoftBodySharedSettings::DihedralBend)
 	JPH_ADD_ATTRIBUTE(SoftBodySharedSettings::DihedralBend, mVertex)
 	JPH_ADD_ATTRIBUTE(SoftBodySharedSettings::DihedralBend, mCompliance)
 	JPH_ADD_ATTRIBUTE(SoftBodySharedSettings::DihedralBend, mInitialAngle)
+	JPH_ADD_ATTRIBUTE(SoftBodySharedSettings::DihedralBend, mBucklingAngle)
+	JPH_ADD_ATTRIBUTE(SoftBodySharedSettings::DihedralBend, mBucklingCompliance)
 }
 
 JPH_IMPLEMENT_SERIALIZABLE_NON_VIRTUAL(SoftBodySharedSettings::Volume)

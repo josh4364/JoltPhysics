@@ -441,8 +441,15 @@ void SoftBodyMotionProperties::ApplyDihedralBendConstraints(const SoftBodyUpdate
 		float w2 = v2.mInvMass;
 		float w3 = v3.mInvMass;
 
+		// Buckling: past a certain deflection the fabric has creased, and a creased fold offers far less resistance than the
+		// flat sheet did. Fabric that keeps one stiffness through both regimes drapes in smooth curves; the change of regime
+		// is what produces distinct folds.
+		float compliance = b->mCompliance;
+		if (b->mBucklingCompliance > compliance && abs(c) > b->mBucklingAngle)
+			compliance = b->mBucklingCompliance;
+
 		// Calculate -lambda
-		float denom = w0 * d0c.LengthSq() + w1 * d1c.LengthSq() + w2 * d2c.LengthSq() + w3 * d3c.LengthSq() + b->mCompliance * inv_dt_sq;
+		float denom = w0 * d0c.LengthSq() + w1 * d1c.LengthSq() + w2 * d2c.LengthSq() + w3 * d3c.LengthSq() + compliance * inv_dt_sq;
 		if (denom < 1.0e-12f)
 			continue;
 		float minus_lambda = c / denom;

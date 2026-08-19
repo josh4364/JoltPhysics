@@ -202,6 +202,19 @@ public:
 		uint32			mVertex[4];									///< Indices of the vertices of the 2 triangles that share an edge (the first 2 vertices are the shared edge)
 		float			mCompliance = 0.0f;							///< Inverse of the stiffness of the constraint
 		float			mInitialAngle = 0.0f;						///< Initial angle between the normals of the triangles (pi - dihedral angle), calculated by CalculateBendConstraintConstants
+
+		/// Buckling: how far this fold may deviate from its rest angle, in radians, before it gives up and folds freely.
+		///
+		/// Real fabric does not resist bending by a single stiffness. It holds its shape against small deflections - the weave has
+		/// structure - and once it has been pushed past the point of creasing it folds far more readily than it first resisted. That
+		/// change of regime is most of what separates a fabric that forms sharp, distinct folds from one that curves smoothly, and
+		/// simulating it with one stiffness gives every fabric the same rounded drape.
+		///
+		/// Beyond this angle @ref mBucklingCompliance is used in place of @ref mCompliance. Ignored unless mBucklingCompliance is
+		/// larger than mCompliance, so a body that says nothing about buckling behaves exactly as it did before.
+		float			mBucklingAngle = 0.0f;
+		/// Inverse of the stiffness once buckled, which should be softer (larger) than @ref mCompliance. Zero disables buckling.
+		float			mBucklingCompliance = 0.0f;
 	};
 
 	/// Volume constraint, keeps the volume of a tetrahedron constant
