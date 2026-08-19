@@ -21,6 +21,10 @@ JPH_NAMESPACE_BEGIN
 
 using namespace JPH::literals;
 
+/// How far a single dihedral bend constraint may move a particle in one sub-step, as a fraction of the edge the two
+/// triangles share. See ApplyDihedralBendConstraints for why the correction needs a bound at all.
+static constexpr float cMaxBendCorrection = 0.5f;
+
 void SoftBodyMotionProperties::CalculateMassAndInertia()
 {
 	MassProperties mp;
@@ -453,6 +457,24 @@ void SoftBodyMotionProperties::ApplyDihedralBendConstraints(const SoftBodyUpdate
 		if (denom < 1.0e-12f)
 			continue;
 		float minus_lambda = c / denom;
+
+		// Bound what one fold may do in one sub-step.
+		//
+		// A dihedral bend is degenerate wherever its two triangles are coplanar - opened out flat, or folded all the way
+		// back against each other - because the sign of the angle is then decided by a cross product that has gone to
+		// zero. Contact drives folds through that configuration routinely: a crease that lands on the floor is pressed
+		// through it in a single step. The correction that comes back is not merely large but unbounded, because the
+		// gradient it is divided by vanishes with the same cross product, and a position correction in XPBD is a velocity
+		// - so one constraint moving a particle a couple of metres is a garment leaving at three hundred metres a second.
+		//
+		// A well conditioned fold moves a fraction of its own edge length, so the limit below is inert in ordinary use
+		// and turns the degenerate case into slow convergence instead of an explosion. Compared squared to keep the
+		// square root on the branch that almost never runs.
+		float largest_sq = max(max(w0 * w0 * d0c.LengthSq(), w1 * w1 * d1c.LengthSq()),
+							   max(w2 * w2 * d2c.LengthSq(), w3 * w3 * d3c.LengthSq()));
+		float limit = cMaxBendCorrection * e_len;
+		if (Square(minus_lambda) * largest_sq > Square(limit))
+			minus_lambda *= limit / (abs(minus_lambda) * sqrt(largest_sq));
 
 		// Apply correction
 		v0.mPosition = x0 - minus_lambda * w0 * d0c;
