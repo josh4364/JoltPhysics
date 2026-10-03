@@ -122,6 +122,11 @@ struct PhysicsSettings
 	/// When false, we prevent collision against non-active (shared) edges. Mainly for debugging the algorithm.
 	bool		mCheckActiveEdges = true;
 
+	/// At most how many SoftBodySimulate jobs of one step are queued or running at the same time; 0 or less for the job system's max concurrency.
+	/// A simulate job that finds no batch of work to take returns instead of waiting for one, and the job that opens new work (the next
+	/// solver iteration of a body) queues helper jobs for it.
+	int			mMaxSoftBodySimulateJobs = 0;
+
 	///@}
 };
 

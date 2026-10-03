@@ -173,6 +173,9 @@ public:
 	/// Update the soft body, will process a batch of work. Not part of the public API.
 	EStatus								ParallelUpdate(SoftBodyUpdateContext &ioContext, const PhysicsSettings &inPhysicsSettings);
 
+	/// How many batches of work ParallelUpdate can hand out now that no thread has taken yet: 0 when the update is done, or while the only work left runs on other threads. Not part of the public API.
+	uint								GetNumParallelBatchesAvailable(const SoftBodyUpdateContext &inContext) const;
+
 	/// Update the velocities of all rigid bodies that we collided with. Not part of the public API.
 	void								UpdateRigidBodyVelocities(const SoftBodyUpdateContext &inContext, BodyInterface &inBodyInterface);
 

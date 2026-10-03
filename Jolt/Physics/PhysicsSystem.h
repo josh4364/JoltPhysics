@@ -286,7 +286,9 @@ private:
 	void						JobSolvePositionConstraints(PhysicsUpdateContext *ioContext, PhysicsUpdateContext::Step *ioStep);
 	void						JobSoftBodyPrepare(PhysicsUpdateContext *ioContext, PhysicsUpdateContext::Step *ioStep);
 	void						JobSoftBodyCollide(PhysicsUpdateContext *ioContext) const;
-	void						JobSoftBodySimulate(PhysicsUpdateContext *ioContext, uint inThreadIndex) const;
+	void						JobSoftBodySimulate(PhysicsUpdateContext *ioContext, PhysicsUpdateContext::Step *ioStep, uint inFirstBody) const;
+	void						QueueSoftBodySimulateHelpers(PhysicsUpdateContext *ioContext, PhysicsUpdateContext::Step *ioStep, uint inBody, uint inAvailable) const;
+	uint						GetNumSoftBodyBatchesAvailable(const PhysicsUpdateContext *inContext) const;
 	void						JobSoftBodyFinalize(PhysicsUpdateContext *ioContext);
 
 	/// Tries to spawn a new FindCollisions job if max concurrency hasn't been reached yet

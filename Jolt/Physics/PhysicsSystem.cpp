@@ -2686,8 +2686,16 @@ void PhysicsSystem::JobSoftBodyPrepare(PhysicsUpdateContext *ioContext, PhysicsU
 	// We're ready to collide the first soft body
 	ioContext->mSoftBodyToCollide.store(0, memory_order_release);
 
-	// Determine number of jobs to spawn
-	int num_soft_body_jobs = ioContext->GetMaxConcurrency();
+	// Determine number of jobs to spawn. A simulate job returns as soon as it finds no batch of work to take, and the job that opens
+	// new work (the next solver iteration of a body) queues helpers for it (QueueSoftBodySimulateHelpers), so start only as many
+	// simulate jobs as the first phase (the collision planes of every body) has batches.
+	int max_concurrency = ioContext->GetMaxConcurrency();
+	int max_simulate_jobs = mPhysicsSettings.mMaxSoftBodySimulateJobs > 0? min(mPhysicsSettings.mMaxSoftBodySimulateJobs, max_concurrency) : max_concurrency;
+	ioContext->mMaxSoftBodySimulateJobs = max_simulate_jobs;
+	uint first_batches = GetNumSoftBodyBatchesAvailable(ioContext);
+	int num_soft_body_jobs = (int)min((uint)max_simulate_jobs, max(1U, first_batches));
+	ioContext->mSoftBodySimulateJobs.store(num_soft_body_jobs, memory_order_relaxed);
+	int num_collide_jobs = min(max_concurrency, (int)ioContext->mNumSoftBodies);
 
 	// Create finalize job
 	ioStep->mSoftBodyFinalize = ioContext->mJobSystem->CreateJob("SoftBodyFinalize", cColorSoftBodyFinalize, [ioContext, ioStep]()
@@ -2697,31 +2705,74 @@ void PhysicsSystem::JobSoftBodyPrepare(PhysicsUpdateContext *ioContext, PhysicsU
 		// Kick the next step
 		if (ioStep->mStartNextStep.IsValid())
 			ioStep->mStartNextStep.RemoveDependency();
-	}, num_soft_body_jobs); // depends on: soft body simulate
+	}, num_soft_body_jobs); // depends on: soft body simulate (a helper adds one dependency for itself)
 	ioContext->mBarrier->AddJob(ioStep->mSoftBodyFinalize);
 
-	// Create simulate jobs
+	// Create simulate jobs, spread over the bodies
+	uint num_soft_bodies = ioContext->mNumSoftBodies;
 	ioStep->mSoftBodySimulate.resize(num_soft_body_jobs);
 	for (int i = 0; i < num_soft_body_jobs; ++i)
-		ioStep->mSoftBodySimulate[i] = ioContext->mJobSystem->CreateJob("SoftBodySimulate", cColorSoftBodySimulate, [ioStep, i]()
+	{
+		uint first_body = uint(i) * num_soft_bodies / uint(num_soft_body_jobs);
+		ioStep->mSoftBodySimulate[i] = ioContext->mJobSystem->CreateJob("SoftBodySimulate", cColorSoftBodySimulate, [ioStep, first_body]()
 			{
-				ioStep->mContext->mPhysicsSystem->JobSoftBodySimulate(ioStep->mContext, i);
+				ioStep->mContext->mPhysicsSystem->JobSoftBodySimulate(ioStep->mContext, ioStep, first_body);
 
 				ioStep->mSoftBodyFinalize.RemoveDependency();
-			}, num_soft_body_jobs); // depends on: soft body collide
+			}, num_collide_jobs); // depends on: soft body collide
+	}
 	ioContext->mBarrier->AddJobs(ioStep->mSoftBodySimulate.data(), ioStep->mSoftBodySimulate.size());
 
-	// Create collision jobs
-	ioStep->mSoftBodyCollide.resize(num_soft_body_jobs);
-	for (int i = 0; i < num_soft_body_jobs; ++i)
+	// Create collision jobs. They hold one dependency until they are in the barrier, so that removing it queues them on the job system
+	// (a job made with no dependency is left to the thread that waits on the barrier).
+	ioStep->mSoftBodyCollide.resize(num_collide_jobs);
+	for (int i = 0; i < num_collide_jobs; ++i)
 		ioStep->mSoftBodyCollide[i] = ioContext->mJobSystem->CreateJob("SoftBodyCollide", cColorSoftBodyCollide, [ioContext, ioStep]()
 			{
 				ioContext->mPhysicsSystem->JobSoftBodyCollide(ioContext);
 
 				for (const JobHandle &h : ioStep->mSoftBodySimulate)
 					h.RemoveDependency();
-			}); // depends on: nothing
+			}, 1); // depends on: nothing, see above
 	ioContext->mBarrier->AddJobs(ioStep->mSoftBodyCollide.data(), ioStep->mSoftBodyCollide.size());
+	JobHandle::sRemoveDependencies(ioStep->mSoftBodyCollide.data(), (uint)ioStep->mSoftBodyCollide.size());
+}
+
+uint PhysicsSystem::GetNumSoftBodyBatchesAvailable(const PhysicsUpdateContext *inContext) const
+{
+	uint available = 0;
+	for (const SoftBodyUpdateContext *sb_ctx = inContext->mSoftBodyUpdateContexts, *sb_ctx_end = inContext->mSoftBodyUpdateContexts + inContext->mNumSoftBodies; sb_ctx < sb_ctx_end; ++sb_ctx)
+		available += sb_ctx->mMotionProperties->GetNumParallelBatchesAvailable(*sb_ctx);
+	return available;
+}
+
+void PhysicsSystem::QueueSoftBodySimulateHelpers(PhysicsUpdateContext *ioContext, PhysicsUpdateContext::Step *ioStep, uint inBody, uint inAvailable) const
+{
+	// The calling job takes one of the batches itself
+	int running = ioContext->mSoftBodySimulateJobs.load(memory_order_relaxed);
+	int num_helpers;
+	do
+	{
+		num_helpers = min(int(inAvailable) - 1, ioContext->mMaxSoftBodySimulateJobs - running);
+		if (num_helpers <= 0)
+			return;
+	}
+	while (!ioContext->mSoftBodySimulateJobs.compare_exchange_weak(running, running + num_helpers, memory_order_acq_rel, memory_order_relaxed));
+
+	// The calling job still holds its own dependency on the finalize job, so the finalize job cannot have started
+	ioStep->mSoftBodyFinalize.AddDependency(num_helpers);
+
+	for (int i = 0; i < num_helpers; ++i)
+	{
+		JobHandle helper = ioContext->mJobSystem->CreateJob("SoftBodySimulate", cColorSoftBodySimulate, [ioContext, ioStep, inBody]()
+			{
+				ioContext->mPhysicsSystem->JobSoftBodySimulate(ioContext, ioStep, inBody);
+
+				ioStep->mSoftBodyFinalize.RemoveDependency();
+			}, 1); // held until it is in the barrier, removing it queues the job
+		ioContext->mBarrier->AddJob(helper);
+		helper.RemoveDependency();
+	}
 }
 
 void PhysicsSystem::JobSoftBodyCollide(PhysicsUpdateContext *ioContext) const
@@ -2744,44 +2795,47 @@ void PhysicsSystem::JobSoftBodyCollide(PhysicsUpdateContext *ioContext) const
 	}
 }
 
-void PhysicsSystem::JobSoftBodySimulate(PhysicsUpdateContext *ioContext, uint inThreadIndex) const
+void PhysicsSystem::JobSoftBodySimulate(PhysicsUpdateContext *ioContext, PhysicsUpdateContext::Step *ioStep, uint inFirstBody) const
 {
 #ifdef JPH_ENABLE_ASSERTS
 	// Updating velocities of soft bodies, allow the contact listener to read the soft body state
 	BodyAccess::Grant grant(BodyAccess::EAccess::ReadWrite, BodyAccess::EAccess::Read);
 #endif
 
-	// Calculate at which body we start to distribute the workload across the threads
 	uint num_soft_bodies = ioContext->mNumSoftBodies;
-	uint start_idx = inThreadIndex * num_soft_bodies / ioContext->GetMaxConcurrency();
+	uint start_idx = inFirstBody % num_soft_bodies;
 
-	// Keep running partial updates until everything has been updated
-	uint status;
-	do
+	// Take batches of work until a full pass over the bodies finds none. The job then returns instead of waiting for the batches that
+	// other jobs still work on: the job that finishes a phase of a body opens the next one and queues helpers for it.
+	for (;;)
 	{
-		// Reset status
-		status = 0;
-
-		// Update all soft bodies
+		bool did_work = false;
 		for (uint i = 0; i < num_soft_bodies; ++i)
 		{
-			// Fetch the soft body context
-			SoftBodyUpdateContext &sb_ctx = ioContext->mSoftBodyUpdateContexts[(start_idx + i) % num_soft_bodies];
+			uint sb_idx = (start_idx + i) % num_soft_bodies;
+			SoftBodyUpdateContext &sb_ctx = ioContext->mSoftBodyUpdateContexts[sb_idx];
 
 			// To avoid trashing the cache too much, we prefer to stick to one soft body until we cannot progress it any further
-			uint sb_status;
-			do
+			while (sb_ctx.mMotionProperties->ParallelUpdate(sb_ctx, mPhysicsSettings) == SoftBodyMotionProperties::EStatus::DidWork)
 			{
-				sb_status = (uint)sb_ctx.mMotionProperties->ParallelUpdate(sb_ctx, mPhysicsSettings);
-				status |= sb_status;
-			} while (sb_status == (uint)SoftBodyMotionProperties::EStatus::DidWork);
-		}
+				did_work = true;
 
-		// If we didn't perform any work, yield the thread so that something else can run
-		if (!(status & (uint)SoftBodyMotionProperties::EStatus::DidWork))
-			std::this_thread::yield();
+				// Work on this body that no job has taken yet (a new iteration opened by this job, or the rest of one) gets helpers
+				uint available = sb_ctx.mMotionProperties->GetNumParallelBatchesAvailable(sb_ctx);
+				if (available > 1)
+					QueueSoftBodySimulateHelpers(ioContext, ioStep, sb_idx, available);
+			}
+		}
+		if (did_work)
+			continue;
+
+		// No batch to take on any body: give up the thread. Work opened between the pass and the line below counted this job as one
+		// that would take it, so look once more before returning.
+		ioContext->mSoftBodySimulateJobs.fetch_sub(1, memory_order_acq_rel);
+		if (GetNumSoftBodyBatchesAvailable(ioContext) == 0)
+			break;
+		ioContext->mSoftBodySimulateJobs.fetch_add(1, memory_order_acq_rel);
 	}
-	while (status != (uint)SoftBodyMotionProperties::EStatus::Done);
 }
 
 void PhysicsSystem::JobSoftBodyFinalize(PhysicsUpdateContext *ioContext)

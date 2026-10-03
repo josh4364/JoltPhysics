@@ -172,6 +172,8 @@ public:
 	uint					mNumSoftBodies;											///< Number of active soft bodies in the simulation
 	SoftBodyUpdateContext *	mSoftBodyUpdateContexts = nullptr;						///< Contexts for updating soft bodies
 	atomic<uint>			mSoftBodyToCollide { 0 };								///< Next soft body to take when running SoftBodyCollide jobs
+	atomic<int>				mSoftBodySimulateJobs { 0 };							///< Number of SoftBodySimulate jobs that are queued or running and still look for work
+	int						mMaxSoftBodySimulateJobs = 1;							///< At most how many SoftBodySimulate jobs are queued or running at the same time
 };
 /// @endcond
 

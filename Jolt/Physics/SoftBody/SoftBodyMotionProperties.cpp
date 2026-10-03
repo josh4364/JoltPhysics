@@ -1143,6 +1143,39 @@ SoftBodyMotionProperties::EStatus SoftBodyMotionProperties::ParallelApplyConstra
 	return EStatus::NoWork;
 }
 
+uint SoftBodyMotionProperties::GetNumParallelBatchesAvailable(const SoftBodyUpdateContext &inContext) const
+{
+	switch (inContext.mState.load(memory_order_acquire))
+	{
+	case SoftBodyUpdateContext::EState::DetermineCollisionPlanes:
+		{
+			uint num_vertices = (uint)mVertices.size();
+			uint next_vertex = inContext.mNextCollisionVertex.load(memory_order_relaxed);
+			return next_vertex < num_vertices? (num_vertices - next_vertex + SoftBodyUpdateContext::cVertexCollisionBatch - 1) / SoftBodyUpdateContext::cVertexCollisionBatch : 0;
+		}
+
+	case SoftBodyUpdateContext::EState::DetermineSensorCollisions:
+		{
+			uint next_sensor = inContext.mNextSensorIndex.load(memory_order_relaxed);
+			return next_sensor < mNumSensors? mNumSensors - next_sensor : 0;
+		}
+
+	case SoftBodyUpdateContext::EState::ApplyConstraints:
+		{
+			// The same test as ParallelApplyConstraints: the last group is the non-parallel group
+			uint num_groups = (uint)mSettings->mUpdateGroups.size() - 1;
+			uint next_group = inContext.mNextConstraintGroup.load(memory_order_relaxed);
+			if (num_groups == 0)
+				return next_group == 0? 1 : 0;
+			return next_group < num_groups? num_groups - next_group : 0;
+		}
+
+	case SoftBodyUpdateContext::EState::Done:
+	default:
+		return 0;
+	}
+}
+
 SoftBodyMotionProperties::EStatus SoftBodyMotionProperties::ParallelUpdate(SoftBodyUpdateContext &ioContext, const PhysicsSettings &inPhysicsSettings)
 {
 	switch (ioContext.mState.load(memory_order_acquire))
