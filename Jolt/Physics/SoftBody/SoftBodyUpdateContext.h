@@ -23,6 +23,7 @@ class SoftBodyUpdateContext : public NonCopyable
 public:
 	static constexpr uint				cVertexCollisionBatch = 64;					///< Number of vertices to process in a batch in DetermineCollisionPlanes
 	static constexpr uint				cVertexConstraintBatch = 256;				///< Number of vertices to group for processing batches of constraints in ApplyEdgeConstraints
+	static constexpr uint				cVertexVelocityBatch = 128;					///< Number of vertices to process in a batch in ParallelUpdateVelocities
 
 	// Input
 	Body *								mBody;										///< Body that is being updated
@@ -41,6 +42,7 @@ public:
 		DetermineCollisionPlanes,													///< Determine collision planes for vertices in parallel
 		DetermineSensorCollisions,													///< Determine collisions with sensors in parallel
 		ApplyConstraints,															///< Apply constraints in parallel
+		UpdateVelocities,														///< Apply collision constraints, update velocities and integrate the next iteration in parallel
 		Done																		///< Update is finished
 	};
 
@@ -53,6 +55,8 @@ public:
 	atomic<uint>						mNextIteration { 0 };						///< Next simulation iteration to process
 	atomic<uint>						mNextConstraintGroup { 0 };					///< Next constraint group to process
 	atomic<uint>						mNumConstraintGroupsProcessed { 0 };		///< Number of groups processed, used to determine if we can go to the next iteration
+	atomic<uint>						mNextVelocityBatch { 0 };					///< Next batch of vertices to process for UpdateVelocities
+	atomic<uint>						mNumVelocityBatchesProcessed { 0 };			///< Number of batches processed by UpdateVelocities, used to determine if we can go to the next iteration
 
 	// Output
 	Vec3								mDeltaPosition;								///< Delta position of the body in the current time step, should be applied after the update

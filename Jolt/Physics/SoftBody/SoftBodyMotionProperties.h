@@ -251,7 +251,7 @@ private:
 	};
 
 	/// Do a narrow phase check and determine the closest feature that we can collide with
-	void								DetermineCollisionPlanes(uint inVertexStart, uint inNumVertices);
+	void								DetermineCollisionPlanes(const SoftBodyUpdateContext &inContext, uint inVertexStart, uint inNumVertices);
 
 	/// Do a narrow phase check between a single sensor and the soft body
 	void								DetermineSensorCollisions(CollidingSensor &ioSensor);
@@ -259,8 +259,11 @@ private:
 	/// Apply pressure force and update the vertex velocities
 	void								ApplyPressure(const SoftBodyUpdateContext &inContext);
 
-	/// Integrate the positions of all vertices by 1 sub step
-	void								IntegratePositions(const SoftBodyUpdateContext &inContext);
+	/// Integrate the positions of vertices [inStartIndex, inEndIndex) by 1 sub step
+	void								IntegratePositions(const SoftBodyUpdateContext &inContext, uint inStartIndex, uint inEndIndex);
+
+	/// Integrate the rod orientations by 1 sub step
+	void								IntegrateRods(const SoftBodyUpdateContext &inContext);
 
 	/// Enforce all bend constraints
 	void								ApplyDihedralBendConstraints(const SoftBodyUpdateContext &inContext, uint inStartIndex, uint inEndIndex);
@@ -281,8 +284,12 @@ private:
 	/// Enforce all LRA constraints
 	void								ApplyLRAConstraints(uint inStartIndex, uint inEndIndex);
 
-	/// Enforce all collision constraints & update all velocities according the XPBD algorithm
-	void								ApplyCollisionConstraintsAndUpdateVelocities(const SoftBodyUpdateContext &inContext);
+	/// Enforce the collision constraints & update the velocities of the vertices of batch inBatch according the XPBD algorithm.
+	/// Batches run on several threads at once: the impulses on dynamic bodies go to the batch's own row of mBatchVelocityDeltas.
+	void								ApplyCollisionConstraintsAndUpdateVelocities(const SoftBodyUpdateContext &inContext, uint inBatch);
+
+	/// Add the impulses of every batch to the dynamic bodies, in batch order, and update the angular velocities of the rods
+	void								FinishVelocities(const SoftBodyUpdateContext &inContext);
 
 	/// Update the state of the soft body (position, velocity, bounds)
 	void								UpdateSoftBodyState(SoftBodyUpdateContext &ioContext, const PhysicsSettings &inPhysicsSettings);
@@ -298,6 +305,9 @@ private:
 
 	/// Helper function for ParallelUpdate that works on sensor collisions
 	EStatus								ParallelDetermineSensorCollisions(SoftBodyUpdateContext &ioContext);
+
+	/// Helper function for ParallelUpdate that works on batches of vertices: collision constraints, velocities, and the integration of the next iteration
+	EStatus								ParallelUpdateVelocities(SoftBodyUpdateContext &ioContext, const PhysicsSettings &inPhysicsSettings);
 
 	/// Helper function for ParallelUpdate that works on batches of constraints
 	EStatus								ParallelApplyConstraints(SoftBodyUpdateContext &ioContext, const PhysicsSettings &inPhysicsSettings);
@@ -320,6 +330,8 @@ private:
 	Array<Vertex>						mVertices;									///< Current state of all vertices in the simulation
 	Array<RodState>						mRodStates;									///< Current state of all rods in the simulation
 	Array<CollidingShape>				mCollidingShapes;							///< List of colliding shapes retrieved during the last update
+	Array<Vec3>							mBatchVelocityDeltas;						///< Per velocity batch and colliding shape: the linear, then the angular velocity the batch gave a dynamic body this iteration
+	bool								mHasDynamicCollidingShape = false;			///< A colliding shape of this update is dynamic, so the velocity batches use mBatchVelocityDeltas
 	Array<CollidingSensor>				mCollidingSensors;							///< List of colliding sensors retrieved during the last update
 	Array<SkinState>					mSkinState;									///< List of skinned positions (1-on-1 with mVertices but only those that are used by the skinning constraints are filled in)
 	AABox								mLocalBounds;								///< Bounding box of all vertices

@@ -256,16 +256,54 @@ void SoftBodyMotionProperties::DetermineCollidingShapes(const SoftBodyUpdateCont
 	DefaultObjectLayerFilter object_layer_filter = inSystem.GetDefaultLayerFilter(layer);
 	inSystem.GetBroadPhaseQuery().CollideAABox(world_bounds, collector, broadphase_layer_filter, object_layer_filter);
 	mNumSensors = uint(mCollidingSensors.size()); // Workaround for TSAN false positive: store mCollidingSensors.size() in a separate variable.
+
+	// The velocity batches give dynamic bodies their impulses through mBatchVelocityDeltas
+	mHasDynamicCollidingShape = false;
+	for (const CollidingShape &cs : mCollidingShapes)
+		mHasDynamicCollidingShape |= cs.mMotionType == EMotionType::Dynamic;
 }
 
-void SoftBodyMotionProperties::DetermineCollisionPlanes(uint inVertexStart, uint inNumVertices)
+void SoftBodyMotionProperties::DetermineCollisionPlanes(const SoftBodyUpdateContext &inContext, uint inVertexStart, uint inNumVertices)
 {
 	JPH_PROFILE_FUNCTION();
 
-	// Generate collision planes
+	// The bounds of each vertex and of the batch, as DetermineCollidingShapes builds the bounds of the body: where the vertex is and where
+	// it will be at the end of the step, plus the vertex radius. A leaf shape outside the bounds of a vertex can give it no contact this step.
+	JPH_ASSERT(inNumVertices <= SoftBodyUpdateContext::cVertexCollisionBatch);
+	AABox vertex_bounds[SoftBodyUpdateContext::cVertexCollisionBatch];
+	AABox batch_bounds;
+	Vec3 radius = Vec3::sReplicate(mVertexRadius);
+	for (uint i = 0; i < inNumVertices; ++i)
+	{
+		const Vertex &v = mVertices[inVertexStart + i];
+		AABox &bounds = vertex_bounds[i];
+		bounds = AABox(v.mPosition, v.mPosition);
+		bounds.Encapsulate(v.mPosition + v.mVelocity * inContext.mDeltaTime + inContext.mDisplacementDueToGravity);
+		bounds.ExpandBy(radius);
+		batch_bounds.Encapsulate(bounds);
+	}
+
+	// Generate collision planes, for each run of vertices that the shape can reach
 	for (const CollidingShape &cs : mCollidingShapes)
 		for (const LeafShape &shape : cs.mShapes)
-			shape.mShape->CollideSoftBodyVertices(shape.mTransform, shape.mScale, CollideSoftBodyVertexIterator(mVertices.data() + inVertexStart), inNumVertices, int(&cs - mCollidingShapes.data()));
+		{
+			AABox shape_bounds = shape.mShape->GetWorldSpaceBounds(shape.mTransform, shape.mScale);
+			if (!shape_bounds.Overlaps(batch_bounds))
+				continue;
+			for (uint start = 0; start < inNumVertices; )
+			{
+				if (!shape_bounds.Overlaps(vertex_bounds[start]))
+				{
+					++start;
+					continue;
+				}
+				uint end = start + 1;
+				while (end < inNumVertices && shape_bounds.Overlaps(vertex_bounds[end]))
+					++end;
+				shape.mShape->CollideSoftBodyVertices(shape.mTransform, shape.mScale, CollideSoftBodyVertexIterator(mVertices.data() + inVertexStart + start), end - start, int(&cs - mCollidingShapes.data()));
+				start = end;
+			}
+		}
 }
 
 void SoftBodyMotionProperties::DetermineSensorCollisions(CollidingSensor &ioSensor)
@@ -326,7 +364,7 @@ void SoftBodyMotionProperties::ApplyPressure(const SoftBodyUpdateContext &inCont
 	}
 }
 
-void SoftBodyMotionProperties::IntegratePositions(const SoftBodyUpdateContext &inContext)
+void SoftBodyMotionProperties::IntegratePositions(const SoftBodyUpdateContext &inContext, uint inStartIndex, uint inEndIndex)
 {
 	JPH_PROFILE_FUNCTION();
 
@@ -336,8 +374,9 @@ void SoftBodyMotionProperties::IntegratePositions(const SoftBodyUpdateContext &i
 	// Integrate
 	Vec3 sub_step_gravity = inContext.mGravity * dt;
 	Vec3 sub_step_impulse = GetAccumulatedForce() * dt / max(float(mVertices.size()), 1.0f);
-	for (Vertex &v : mVertices)
+	for (Vertex *v_it = mVertices.data() + inStartIndex, *v_end = mVertices.data() + inEndIndex; v_it < v_end; ++v_it)
 	{
+		Vertex &v = *v_it;
 		if (v.mInvMass > 0.0f)
 		{
 			// Gravity
@@ -352,6 +391,12 @@ void SoftBodyMotionProperties::IntegratePositions(const SoftBodyUpdateContext &i
 		v.mPreviousPosition = position;
 		v.mPosition = position + v.mVelocity * dt;
 	}
+}
+
+void SoftBodyMotionProperties::IntegrateRods(const SoftBodyUpdateContext &inContext)
+{
+	float dt = inContext.mSubStepDeltaTime;
+	float linear_damping = max(0.0f, 1.0f - GetLinearDamping() * dt); // See: MotionProperties::ApplyForceTorqueAndDragInternal
 
 	// Integrate rod orientations
 	float half_dt = 0.5f * dt;
@@ -726,14 +771,22 @@ void SoftBodyMotionProperties::ApplyLRAConstraints(uint inStartIndex, uint inEnd
 	}
 }
 
-void SoftBodyMotionProperties::ApplyCollisionConstraintsAndUpdateVelocities(const SoftBodyUpdateContext &inContext)
+void SoftBodyMotionProperties::ApplyCollisionConstraintsAndUpdateVelocities(const SoftBodyUpdateContext &inContext, uint inBatch)
 {
 	JPH_PROFILE_FUNCTION();
 
 	float dt = inContext.mSubStepDeltaTime;
 	float restitution_threshold = -2.0f * inContext.mGravity.Length() * dt;
 	float vertex_radius = mVertexRadius;
-	for (Vertex &v : mVertices)
+
+	// This batch's velocity deltas of the dynamic bodies: the body's velocity is the one at the start of the phase plus what this batch gave it
+	Vec3 *deltas = mHasDynamicCollidingShape? mBatchVelocityDeltas.data() + size_t(inBatch) * mCollidingShapes.size() * 2 : nullptr;
+
+	uint start = inBatch * SoftBodyUpdateContext::cVertexVelocityBatch;
+	uint end = min(start + SoftBodyUpdateContext::cVertexVelocityBatch, (uint)mVertices.size());
+	for (Vertex *v_it = mVertices.data() + start, *v_end = mVertices.data() + end; v_it < v_end; ++v_it)
+	{
+		Vertex &v = *v_it;
 		if (v.mInvMass > 0.0f)
 		{
 			// Remember previous velocity for restitution calculations
@@ -757,7 +810,7 @@ void SoftBodyMotionProperties::ApplyCollisionConstraintsAndUpdateVelocities(cons
 					RequestContactCallback();
 
 					// Note that we already calculated the velocity, so this does not affect the velocity (next iteration starts by setting previous position to current position)
-					CollidingShape &cs = mCollidingShapes[v.mCollidingShapeIndex];
+					const CollidingShape &cs = mCollidingShapes[v.mCollidingShapeIndex];
 					Vec3 contact_normal = v.mCollisionPlane.GetNormal();
 					v.mPosition += contact_normal * projected_distance;
 
@@ -782,7 +835,9 @@ void SoftBodyMotionProperties::ApplyCollisionConstraintsAndUpdateVelocities(cons
 					{
 						// Calculate normal and tangential velocity (equation 30)
 						Vec3 r2 = v.mPosition - cs.mCenterOfMassTransform.GetTranslation();
-						Vec3 v2 = cs.GetPointVelocity(r2);
+						Vec3 &delta_linear = deltas[2 * v.mCollidingShapeIndex];
+						Vec3 &delta_angular = deltas[2 * v.mCollidingShapeIndex + 1];
+						Vec3 v2 = cs.mLinearVelocity + delta_linear + (cs.mAngularVelocity + delta_angular).Cross(r2);
 						Vec3 relative_velocity = v.mVelocity - v2;
 						Vec3 v_normal = contact_normal * contact_normal.Dot(relative_velocity);
 						Vec3 v_tangential = relative_velocity - v_normal;
@@ -816,12 +871,9 @@ void SoftBodyMotionProperties::ApplyCollisionConstraintsAndUpdateVelocities(cons
 							// Apply impulse to particle
 							v.mVelocity -= p * vertex_inv_mass;
 
-							// Apply impulse to rigid body
-							cs.mLinearVelocity += p * cs.mInvMass;
-							cs.mAngularVelocity += cs.mInvInertia * r2.Cross(p);
-
-							// Mark that the velocities of the body we hit need to be updated
-							cs.mUpdateVelocities = true;
+							// Apply impulse to rigid body, through the batch's deltas (FinishVelocities adds them to the body)
+							delta_linear += p * cs.mInvMass;
+							delta_angular += cs.mInvInertia * r2.Cross(p);
 						}
 					}
 					else if (cs.mSoftBodyInvMassScale > 0.0f)
@@ -846,9 +898,40 @@ void SoftBodyMotionProperties::ApplyCollisionConstraintsAndUpdateVelocities(cons
 				}
 			}
 		}
+	}
+}
+
+void SoftBodyMotionProperties::FinishVelocities(const SoftBodyUpdateContext &inContext)
+{
+	// The impulses of the batches on the dynamic bodies, in batch order so that the sum does not depend on which thread ran which batch
+	if (mHasDynamicCollidingShape)
+	{
+		uint num_shapes = (uint)mCollidingShapes.size();
+		uint num_batches = (uint)mBatchVelocityDeltas.size() / (2 * num_shapes);
+		for (uint s = 0; s < num_shapes; ++s)
+		{
+			CollidingShape &cs = mCollidingShapes[s];
+			if (cs.mMotionType != EMotionType::Dynamic)
+				continue;
+			Vec3 linear = Vec3::sZero(), angular = Vec3::sZero();
+			for (uint b = 0; b < num_batches; ++b)
+			{
+				linear += mBatchVelocityDeltas[(size_t(b) * num_shapes + s) * 2];
+				angular += mBatchVelocityDeltas[(size_t(b) * num_shapes + s) * 2 + 1];
+			}
+			if (linear != Vec3::sZero() || angular != Vec3::sZero())
+			{
+				cs.mLinearVelocity += linear;
+				cs.mAngularVelocity += angular;
+
+				// Mark that the velocities of the body we hit need to be updated
+				cs.mUpdateVelocities = true;
+			}
+		}
+	}
 
 	// Calculate the new angular velocity for all rods
-	float two_div_dt = 2.0f / dt;
+	float two_div_dt = 2.0f / inContext.mSubStepDeltaTime;
 	for (RodState &r : mRodStates)
 		r.mAngularVelocity = two_div_dt * (r.mRotation * r.mPreviousRotationInternal.Conjugated()).GetXYZ(); // Overwrites mPreviousRotationInternal
 }
@@ -992,7 +1075,9 @@ void SoftBodyMotionProperties::StartNextIteration(const SoftBodyUpdateContext &i
 {
 	ApplyPressure(ioContext);
 
-	IntegratePositions(ioContext);
+	IntegratePositions(ioContext, 0, (uint)mVertices.size());
+
+	IntegrateRods(ioContext);
 }
 
 void SoftBodyMotionProperties::StartFirstIteration(SoftBodyUpdateContext &ioContext)
@@ -1016,7 +1101,7 @@ SoftBodyMotionProperties::EStatus SoftBodyMotionProperties::ParallelDetermineCol
 		{
 			// Process collision planes
 			uint num_vertices_to_process = min(SoftBodyUpdateContext::cVertexCollisionBatch, num_vertices - next_vertex);
-			DetermineCollisionPlanes(next_vertex, num_vertices_to_process);
+			DetermineCollisionPlanes(ioContext, next_vertex, num_vertices_to_process);
 			uint vertices_processed = ioContext.mNumCollisionVerticesProcessed.fetch_add(SoftBodyUpdateContext::cVertexCollisionBatch, memory_order_acq_rel) + num_vertices_to_process;
 			if (vertices_processed >= num_vertices)
 			{
@@ -1115,32 +1200,76 @@ SoftBodyMotionProperties::EStatus SoftBodyMotionProperties::ParallelApplyConstra
 				// Process non-parallel group
 				ProcessGroup(ioContext, num_groups);
 
-				ApplyCollisionConstraintsAndUpdateVelocities(ioContext);
-
-				uint iteration = ioContext.mNextIteration.fetch_add(1, memory_order_relaxed);
-				if (iteration < mNumIterations)
+				// The collision constraints and the velocities go to batches of vertices, each with its own row of velocity deltas
+				if (mHasDynamicCollidingShape)
 				{
-					// Start a new iteration
-					StartNextIteration(ioContext);
-
-					// Reset group logic
-					ioContext.mNumConstraintGroupsProcessed.store(0, memory_order_release);
-					ioContext.mNextConstraintGroup.store(0, memory_order_release);
+					uint num_batches = max(1U, ((uint)mVertices.size() + SoftBodyUpdateContext::cVertexVelocityBatch - 1) / SoftBodyUpdateContext::cVertexVelocityBatch);
+					mBatchVelocityDeltas.resize(size_t(num_batches) * mCollidingShapes.size() * 2);
+					std::fill(mBatchVelocityDeltas.begin(), mBatchVelocityDeltas.end(), Vec3::sZero());
 				}
-				else
-				{
-					// On final iteration we update the state
-					UpdateSoftBodyState(ioContext, inPhysicsSettings);
-
-					ioContext.mState.store(SoftBodyUpdateContext::EState::Done, memory_order_release);
-					return EStatus::Done;
-				}
+				ioContext.mNumVelocityBatchesProcessed.store(0, memory_order_relaxed);
+				ioContext.mNextVelocityBatch.store(0, memory_order_relaxed);
+				ioContext.mState.store(SoftBodyUpdateContext::EState::UpdateVelocities, memory_order_release);
 			}
 
 			return EStatus::DidWork;
 		}
 	}
 	return EStatus::NoWork;
+}
+
+SoftBodyMotionProperties::EStatus SoftBodyMotionProperties::ParallelUpdateVelocities(SoftBodyUpdateContext &ioContext, const PhysicsSettings &inPhysicsSettings)
+{
+	// A body with no vertices still has one batch, which finishes the iteration
+	uint num_vertices = (uint)mVertices.size();
+	uint num_batches = max(1U, (num_vertices + SoftBodyUpdateContext::cVertexVelocityBatch - 1) / SoftBodyUpdateContext::cVertexVelocityBatch);
+
+	// Do a relaxed read first to see if there is any work to do
+	if (ioContext.mNextVelocityBatch.load(memory_order_relaxed) >= num_batches)
+		return EStatus::NoWork;
+	uint batch = ioContext.mNextVelocityBatch.fetch_add(1, memory_order_acquire);
+	if (batch >= num_batches)
+		return EStatus::NoWork;
+
+	ApplyCollisionConstraintsAndUpdateVelocities(ioContext, batch);
+
+	// With no pressure the next iteration integrates each vertex on its own, so the batch does it now. Pressure needs the volume of the whole body first.
+	bool integrate_here = ioContext.mNextIteration.load(memory_order_relaxed) < mNumIterations && mPressure <= 0.0f;
+	if (integrate_here)
+	{
+		uint start = batch * SoftBodyUpdateContext::cVertexVelocityBatch;
+		IntegratePositions(ioContext, start, min(start + SoftBodyUpdateContext::cVertexVelocityBatch, num_vertices));
+	}
+
+	if (ioContext.mNumVelocityBatchesProcessed.fetch_add(1, memory_order_acq_rel) + 1 < num_batches)
+		return EStatus::DidWork;
+
+	// The last batch finishes the iteration
+	JPH_PROFILE("FinishIteration");
+
+	FinishVelocities(ioContext);
+
+	uint iteration = ioContext.mNextIteration.fetch_add(1, memory_order_relaxed);
+	if (iteration < mNumIterations)
+	{
+		// Start a new iteration
+		if (integrate_here)
+			IntegrateRods(ioContext);
+		else
+			StartNextIteration(ioContext);
+
+		// Reset group logic
+		ioContext.mNumConstraintGroupsProcessed.store(0, memory_order_relaxed);
+		ioContext.mNextConstraintGroup.store(0, memory_order_relaxed);
+		ioContext.mState.store(SoftBodyUpdateContext::EState::ApplyConstraints, memory_order_release);
+		return EStatus::DidWork;
+	}
+
+	// On final iteration we update the state
+	UpdateSoftBodyState(ioContext, inPhysicsSettings);
+
+	ioContext.mState.store(SoftBodyUpdateContext::EState::Done, memory_order_release);
+	return EStatus::Done;
 }
 
 uint SoftBodyMotionProperties::GetNumParallelBatchesAvailable(const SoftBodyUpdateContext &inContext) const
@@ -1170,6 +1299,13 @@ uint SoftBodyMotionProperties::GetNumParallelBatchesAvailable(const SoftBodyUpda
 			return next_group < num_groups? num_groups - next_group : 0;
 		}
 
+	case SoftBodyUpdateContext::EState::UpdateVelocities:
+		{
+			uint num_batches = max(1U, ((uint)mVertices.size() + SoftBodyUpdateContext::cVertexVelocityBatch - 1) / SoftBodyUpdateContext::cVertexVelocityBatch);
+			uint next_batch = inContext.mNextVelocityBatch.load(memory_order_relaxed);
+			return next_batch < num_batches? num_batches - next_batch : 0;
+		}
+
 	case SoftBodyUpdateContext::EState::Done:
 	default:
 		return 0;
@@ -1188,6 +1324,9 @@ SoftBodyMotionProperties::EStatus SoftBodyMotionProperties::ParallelUpdate(SoftB
 
 	case SoftBodyUpdateContext::EState::ApplyConstraints:
 		return ParallelApplyConstraints(ioContext, inPhysicsSettings);
+
+	case SoftBodyUpdateContext::EState::UpdateVelocities:
+		return ParallelUpdateVelocities(ioContext, inPhysicsSettings);
 
 	case SoftBodyUpdateContext::EState::Done:
 		return EStatus::Done;
