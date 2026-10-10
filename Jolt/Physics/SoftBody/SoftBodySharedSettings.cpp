@@ -1189,54 +1189,84 @@ void SoftBodySharedSettings::Optimize(OptimizationResults &outResults)
 
 void SoftBodySharedSettings::CalculateConstraintBatches()
 {
-	// Packs the constraints of each group into batches of four that share no vertex, keeping the result of the sequential solve:
-	// a constraint joins the batch being filled only when it shares no vertex with the batch nor with any earlier constraint that
-	// still waits. A constraint therefore only moves ahead of constraints that it does not touch, and solving the batches one after
-	// another gives the same positions as solving the constraints in their own order, up to rounding.
-	constexpr uint cWindow = 1024; // Waiting constraints a batch looks at before it closes with fewer than four
-
-	Array<uint32> stamp;
-	stamp.resize(mVertices.size(), 0);
-	uint32 current_stamp = 0;
-	Array<bool> taken;
+	// Packs the constraints of each group into batches of four that share no vertex.
+	// inKeepOrder keeps the result of the sequential solve: each constraint goes to the first batch with room after the last batch that
+	// touches one of its vertices. A constraint so only moves ahead of constraints that it shares no vertex with, and solving the
+	// batches one after another gives the same positions as solving the constraints in their own order, up to rounding.
+	// Without inKeepOrder each constraint goes to the first batch with room that shares none of its vertices: the batches fill up
+	// (a tetrahedron mesh keeps 2.9 tetrahedra a batch in order, 3.9 out of it) and the sweep is in a different order.
+	Array<uint32> last_batch; // Per vertex: 1 + the last batch of this group that touches it, 0 for none
+	last_batch.resize(mVertices.size(), 0);
+	Array<uint> batches; // Per batch: 4 constraint indices, unused ones are ~0U
+	Array<uint8> batch_count;
+	Array<uint> first_with_room; // Per full batch: a later batch with no batch with room in between (path halving keeps the search short)
 
 	// inGetVertices(constraint, out vertices), inEmit(constraints, count)
-	auto pack = [&stamp, &current_stamp, &taken](uint inStart, uint inEnd, uint inNumVertices, const auto &inGetVertices, const auto &inEmit)
+	auto pack = [&last_batch, &batches, &batch_count, &first_with_room](uint inStart, uint inEnd, uint inNumVertices, bool inKeepOrder, const auto &inGetVertices, const auto &inEmit)
 	{
-		taken.clear();
-		taken.resize(inEnd - inStart, false);
-		uint head = 0;
-		for (;;)
+		batches.clear();
+		batch_count.clear();
+		first_with_room.clear();
+		for (uint c = inStart; c < inEnd; ++c)
 		{
-			while (head < inEnd - inStart && taken[head])
-				++head;
-			if (head >= inEnd - inStart)
-				break;
+			uint32 v[4];
+			inGetVertices(c, v);
+			uint b = 0;
+			if (inKeepOrder)
+				for (uint k = 0; k < inNumVertices; ++k)
+					b = max(b, (uint)last_batch[v[k]]);
 
-			++current_stamp;
-			uint batch[4];
-			uint count = 0;
-			uint scanned = 0;
-			for (uint i = head; i < inEnd - inStart && scanned < cWindow && count < 4; ++i)
+			for (;;)
 			{
-				if (taken[i])
-					continue;
-				++scanned;
-				uint32 v[4];
-				inGetVertices(inStart + i, v);
-				bool free = true;
-				for (uint k = 0; k < inNumVertices; ++k)
-					if (stamp[v[k]] == current_stamp)
-						free = false;
-				for (uint k = 0; k < inNumVertices; ++k)
-					stamp[v[k]] = current_stamp;
-				if (free)
+				// Skip the full batches
+				while (b < (uint)batch_count.size() && batch_count[b] == 4)
 				{
-					batch[count++] = inStart + i;
-					taken[i] = true;
+					uint next = first_with_room[b];
+					if (next < (uint)batch_count.size() && batch_count[next] == 4)
+						first_with_room[b] = first_with_room[next];
+					b = next;
 				}
+				if (inKeepOrder || b == (uint)batch_count.size())
+					break;
+
+				// Out of order, the batch must not hold a constraint that shares a vertex
+				bool shares = false;
+				for (uint m = 0; m < batch_count[b] && !shares; ++m)
+				{
+					uint32 mv[4];
+					inGetVertices(batches[b * 4 + m], mv);
+					for (uint k = 0; k < inNumVertices; ++k)
+						for (uint l = 0; l < inNumVertices; ++l)
+							shares |= v[k] == mv[l];
+				}
+				if (!shares)
+					break;
+				++b;
 			}
-			inEmit(batch, count);
+
+			if (b == (uint)batch_count.size())
+			{
+				batches.resize(batches.size() + 4, ~0U);
+				batch_count.push_back(0);
+				first_with_room.push_back(b + 1);
+			}
+			batches[b * 4 + batch_count[b]] = c;
+			if (++batch_count[b] == 4)
+				first_with_room[b] = b + 1;
+			for (uint k = 0; k < inNumVertices; ++k)
+				last_batch[v[k]] = b + 1;
+		}
+
+		for (uint b = 0; b < (uint)batch_count.size(); ++b)
+			inEmit(&batches[b * 4], batch_count[b]);
+
+		// Reset the vertices for the next group
+		for (uint c = inStart; c < inEnd; ++c)
+		{
+			uint32 v[4];
+			inGetVertices(c, v);
+			for (uint k = 0; k < inNumVertices; ++k)
+				last_batch[v[k]] = 0;
 		}
 	};
 
@@ -1247,7 +1277,7 @@ void SoftBodySharedSettings::CalculateConstraintBatches()
 	uint edge_start = 0, volume_start = 0;
 	for (const UpdateGroup &group : mUpdateGroups)
 	{
-		pack(edge_start, group.mEdgeEndIndex, 2,
+		pack(edge_start, group.mEdgeEndIndex, 2, true, // In order: edges fill 3.9 a batch anyway
 			[this](uint inIndex, uint32 *outVertices) { outVertices[0] = mEdgeConstraints[inIndex].mVertex[0]; outVertices[1] = mEdgeConstraints[inIndex].mVertex[1]; },
 			[this](const uint *inConstraints, uint inCount) {
 				// Padding lanes come first and repeat the first constraint, so the lane that holds it writes its vertices last
@@ -1267,7 +1297,7 @@ void SoftBodySharedSettings::CalculateConstraintBatches()
 		mEdgeBatchEnd.push_back((uint)mEdgeBatches.size());
 		edge_start = group.mEdgeEndIndex;
 
-		pack(volume_start, group.mVolumeEndIndex, 4,
+		pack(volume_start, group.mVolumeEndIndex, 4, false,
 			[this](uint inIndex, uint32 *outVertices) { for (uint k = 0; k < 4; ++k) outVertices[k] = mVolumeConstraints[inIndex].mVertex[k]; },
 			[this](const uint *inConstraints, uint inCount) {
 				VolumeBatch b;
