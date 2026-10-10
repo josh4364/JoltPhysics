@@ -95,6 +95,10 @@ public:
 	/// Optimize the soft body settings without results
 	void				Optimize()									{ OptimizationResults results; Optimize(results); }
 
+	/// Number of batches of four edge constraints and of four volume constraints that Optimize made (Serenity T699)
+	uint				GetNumEdgeBatches() const					{ return (uint)mEdgeBatches.size(); }
+	uint				GetNumVolumeBatches() const					{ return (uint)mVolumeBatches.size(); }
+
 	/// Clone this object
 	Ref<SoftBodySharedSettings> Clone() const;
 
@@ -369,6 +373,25 @@ public:
 	Array<RodBendTwist>	mRodBendTwistConstraints;					///< The list of Cosserat rod constraints that connect two rods and limit the bend and twist
 	PhysicsMaterialList mMaterials { PhysicsMaterial::sDefault };	///< The materials of the faces of the body, referenced by Face::mMaterialIndex
 
+	/// Four edge constraints of one update group that share no vertex, solved together in the lanes of a Vec4 (Serenity T699).
+	/// A batch with fewer than four constraints repeats its first constraint in the leading lanes with mActive cleared.
+	struct alignas(16) EdgeBatch
+	{
+		uint32			mOffset[2][4];								///< mOffset[i][lane] is the byte offset in the vertex array of SoftBodyMotionProperties of vertex i of the constraint in that lane
+		float			mRestLength[4];								///< Rest length of each lane
+		float			mCompliance[4];								///< Compliance of each lane
+		uint32			mActive[4];									///< 0xffffffff for a lane that holds a constraint, 0 for a padding lane
+	};
+
+	/// Four volume constraints of one update group that share no vertex, see EdgeBatch (Serenity T699)
+	struct alignas(16) VolumeBatch
+	{
+		uint32			mOffset[4][4];								///< mOffset[i][lane] is the byte offset of vertex i of the tetrahedron in that lane, see EdgeBatch
+		float			mSixRestVolume[4];							///< Six times the rest volume of each lane
+		float			mCompliance[4];								///< Compliance of each lane
+		uint32			mActive[4];									///< 0xffffffff for a lane that holds a constraint, 0 for a padding lane
+	};
+
 private:
 	friend class SoftBodyMotionProperties;
 
@@ -395,8 +418,15 @@ private:
 		uint			mSkinnedEndIndex;							///< The end index of the skinned constraints in this group
 	};
 
+	/// Calculate mEdgeBatches and mVolumeBatches from the edge and volume constraints of each update group (Serenity T699)
+	void				CalculateConstraintBatches();
+
 	Array<ClosestKinematic> mClosestKinematic;						///< The closest kinematic vertex to each vertex in mVertices
 	Array<UpdateGroup>	mUpdateGroups;								///< The end indices for each group of constraints that can be updated in parallel
+	Array<EdgeBatch>	mEdgeBatches;								///< The edge constraints in batches of four, group after group, in an order that solves to the same result as mEdgeConstraints
+	Array<uint>			mEdgeBatchEnd;								///< The end index in mEdgeBatches of each update group
+	Array<VolumeBatch>	mVolumeBatches;								///< The volume constraints in batches of four, see mEdgeBatches
+	Array<uint>			mVolumeBatchEnd;							///< The end index in mVolumeBatches of each update group
 	Array<uint32>		mSkinnedConstraintNormals;					///< A list of indices in the mFaces array used by mSkinnedConstraints, calculated by CalculateSkinnedConstraintNormals
 };
 

@@ -529,55 +529,156 @@ void SoftBodyMotionProperties::ApplyDihedralBendConstraints(const SoftBodyUpdate
 	}
 }
 
+// Serenity T699: the edge and volume constraints are solved four at a time, one constraint in each lane of a Vec4, from the batches
+// that SoftBodySharedSettings::CalculateConstraintBatches packs. The positions of the four lanes are gathered and transposed into one
+// Vec4 per coordinate, so the solve is plain multiplies and adds without the horizontal sums and shuffles of Vec3 dot and cross products.
+
+// Forced inline also in a debug build of Jolt (JPH_INLINE is a plain inline there), so that the AVX2 copy below is one function
+#if (defined(JPH_COMPILER_GCC) || defined(JPH_COMPILER_CLANG)) && defined(__OPTIMIZE__)
+	#define JPH_SB_INLINE __inline__ __attribute__((always_inline))
+#else
+	#define JPH_SB_INLINE JPH_INLINE
+#endif
+
+/// The vertex at a byte offset of a batch
+static JPH_SB_INLINE SoftBodyVertex &sVertexAt(uint8 *inBase, uint32 inOffset)
+{
+	return *reinterpret_cast<SoftBodyVertex *>(inBase + inOffset);
+}
+
+/// Gathers the positions of the four vertices at inOffset into one vector per coordinate, and their inverse masses
+static JPH_SB_INLINE void sGather(uint8 *inBase, const uint32 *inOffset, Vec4 &outX, Vec4 &outY, Vec4 &outZ, Vec4 &outInvMass)
+{
+	const SoftBodyVertex &v0 = sVertexAt(inBase, inOffset[0]);
+	const SoftBodyVertex &v1 = sVertexAt(inBase, inOffset[1]);
+	const SoftBodyVertex &v2 = sVertexAt(inBase, inOffset[2]);
+	const SoftBodyVertex &v3 = sVertexAt(inBase, inOffset[3]);
+	Mat44 t = Mat44(Vec4(v0.mPosition), Vec4(v1.mPosition), Vec4(v2.mPosition), Vec4(v3.mPosition)).Transposed();
+	outX = t.GetColumn4(0);
+	outY = t.GetColumn4(1);
+	outZ = t.GetColumn4(2);
+	outInvMass = Vec4(v0.mInvMass, v1.mInvMass, v2.mInvMass, v3.mInvMass);
+}
+
+/// Writes the positions of the four vertices at inOffset back, lane 0 first: a padding lane shares its vertices with a later lane, which writes last
+static JPH_SB_INLINE void sScatter(uint8 *inBase, const uint32 *inOffset, Vec4Arg inX, Vec4Arg inY, Vec4Arg inZ)
+{
+	Mat44 t = Mat44(inX, inY, inZ, inZ).Transposed();
+	sVertexAt(inBase, inOffset[0]).mPosition = Vec3(t.GetColumn4(0));
+	sVertexAt(inBase, inOffset[1]).mPosition = Vec3(t.GetColumn4(1));
+	sVertexAt(inBase, inOffset[2]).mPosition = Vec3(t.GetColumn4(2));
+	sVertexAt(inBase, inOffset[3]).mPosition = Vec3(t.GetColumn4(3));
+}
+
+/// Solves the volume constraints of the batches inBatch to inEnd
+static JPH_SB_INLINE void sSolveVolumeBatches(uint8 *inBase, const SoftBodySharedSettings::VolumeBatch *inBatch, const SoftBodySharedSettings::VolumeBatch *inEnd, float inInvDtSq)
+{
+	Vec4 inv_dt_sq = Vec4::sReplicate(inInvDtSq);
+	Vec4 min_denom = Vec4::sReplicate(1.0e-12f);
+
+	for (const SoftBodySharedSettings::VolumeBatch *b = inBatch; b < inEnd; ++b)
+	{
+		Vec4 x1, y1, z1, w1, x2, y2, z2, w2, x3, y3, z3, w3, x4, y4, z4, w4;
+		sGather(inBase, b->mOffset[0], x1, y1, z1, w1);
+		sGather(inBase, b->mOffset[1], x2, y2, z2, w2);
+		sGather(inBase, b->mOffset[2], x3, y3, z3, w3);
+		sGather(inBase, b->mOffset[3], x4, y4, z4, w4);
+
+		// Calculate constraint equation
+		Vec4 ax = x2 - x1, ay = y2 - y1, az = z2 - z1; // x1x2
+		Vec4 bx = x3 - x1, by = y3 - y1, bz = z3 - z1; // x1x3
+		Vec4 cx = x4 - x1, cy = y4 - y1, cz = z4 - z1; // x1x4
+		Vec4 d4x = ay * bz - az * by, d4y = az * bx - ax * bz, d4z = ax * by - ay * bx; // x1x2 x x1x3
+		Vec4 c = (d4x * cx + d4y * cy + d4z * cz).Abs() - Vec4::sLoadFloat4Aligned(reinterpret_cast<const Float4 *>(b->mSixRestVolume));
+
+		// Calculate gradient of constraint equation. The four gradients add up to zero, so the first is minus the sum of the others:
+		// (x4 - x2) x (x3 - x2) = -(x1x3 x x1x4 + x1x4 x x1x2 + x1x2 x x1x3)
+		Vec4 d2x = by * cz - bz * cy, d2y = bz * cx - bx * cz, d2z = bx * cy - by * cx; // x1x3 x x1x4
+		Vec4 d3x = cy * az - cz * ay, d3y = cz * ax - cx * az, d3z = cx * ay - cy * ax; // x1x4 x x1x2
+		Vec4 d1x = -(d2x + d3x + d4x), d1y = -(d2y + d3y + d4y), d1z = -(d2z + d3z + d4z);
+
+		// Calculate -lambda, zero for a padding lane and for a degenerate one
+		Vec4 denom = w1 * (d1x * d1x + d1y * d1y + d1z * d1z) + w2 * (d2x * d2x + d2y * d2y + d2z * d2z)
+			+ w3 * (d3x * d3x + d3y * d3y + d3z * d3z) + w4 * (d4x * d4x + d4y * d4y + d4z * d4z)
+			+ Vec4::sLoadFloat4Aligned(reinterpret_cast<const Float4 *>(b->mCompliance)) * inv_dt_sq;
+		UVec4 apply = UVec4::sAnd(Vec4::sGreaterOrEqual(denom, min_denom), UVec4::sLoadInt4Aligned(b->mActive));
+		Vec4 minus_lambda = Vec4::sSelect(Vec4::sZero(), c / Vec4::sSelect(Vec4::sOne(), denom, apply), apply);
+
+		// Apply correction
+		Vec4 f1 = minus_lambda * w1, f2 = minus_lambda * w2, f3 = minus_lambda * w3, f4 = minus_lambda * w4;
+		sScatter(inBase, b->mOffset[0], x1 - f1 * d1x, y1 - f1 * d1y, z1 - f1 * d1z);
+		sScatter(inBase, b->mOffset[1], x2 - f2 * d2x, y2 - f2 * d2y, z2 - f2 * d2z);
+		sScatter(inBase, b->mOffset[2], x3 - f3 * d3x, y3 - f3 * d3y, z3 - f3 * d3z);
+		sScatter(inBase, b->mOffset[3], x4 - f4 * d4x, y4 - f4 * d4y, z4 - f4 * d4z);
+	}
+}
+
+/// Solves the edge constraints of the batches inBatch to inEnd
+static JPH_SB_INLINE void sSolveEdgeBatches(uint8 *inBase, const SoftBodySharedSettings::EdgeBatch *inBatch, const SoftBodySharedSettings::EdgeBatch *inEnd, float inInvDtSq)
+{
+	Vec4 inv_dt_sq = Vec4::sReplicate(inInvDtSq);
+	Vec4 min_denom = Vec4::sReplicate(1.0e-12f);
+
+	for (const SoftBodySharedSettings::EdgeBatch *b = inBatch; b < inEnd; ++b)
+	{
+		// Get positions
+		Vec4 x0, y0, z0, w0, x1, y1, z1, w1;
+		sGather(inBase, b->mOffset[0], x0, y0, z0, w0);
+		sGather(inBase, b->mOffset[1], x1, y1, z1, w1);
+
+		// Calculate current length
+		Vec4 dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
+		Vec4 length = (dx * dx + dy * dy + dz * dz).Sqrt();
+
+		// Apply correction, zero for a padding lane and for a degenerate one
+		Vec4 denom = length * (w0 + w1 + Vec4::sLoadFloat4Aligned(reinterpret_cast<const Float4 *>(b->mCompliance)) * inv_dt_sq);
+		UVec4 apply = UVec4::sAnd(Vec4::sGreaterOrEqual(denom, min_denom), UVec4::sLoadInt4Aligned(b->mActive));
+		Vec4 scale = Vec4::sSelect(Vec4::sZero(), (length - Vec4::sLoadFloat4Aligned(reinterpret_cast<const Float4 *>(b->mRestLength))) / Vec4::sSelect(Vec4::sOne(), denom, apply), apply);
+		Vec4 cx = dx * scale, cy = dy * scale, cz = dz * scale;
+		sScatter(inBase, b->mOffset[0], x0 + w0 * cx, y0 + w0 * cy, z0 + w0 * cz);
+		sScatter(inBase, b->mOffset[1], x1 - w1 * cx, y1 - w1 * cy, z1 - w1 * cz);
+	}
+}
+
+// Jolt is built for plain x86-64 (SSE2), whose two-operand instructions spend a register copy on most of the arithmetic above.
+// The same code compiled for AVX2 and FMA (three-operand VEX encoding, fused multiply-add) takes about a third fewer
+// instructions, so a CPU that has them runs that copy (Serenity T699).
+#if defined(JPH_CPU_X86) && (defined(JPH_COMPILER_GCC) || defined(JPH_COMPILER_CLANG)) && !defined(JPH_USE_AVX2)
+	#define JPH_SOFT_BODY_AVX2_DISPATCH
+
+__attribute__((target("avx2,fma"))) static void sSolveVolumeBatchesAVX2(uint8 *inBase, const SoftBodySharedSettings::VolumeBatch *inBatch, const SoftBodySharedSettings::VolumeBatch *inEnd, float inInvDtSq)
+{
+	sSolveVolumeBatches(inBase, inBatch, inEnd, inInvDtSq);
+}
+
+__attribute__((target("avx2,fma"))) static void sSolveEdgeBatchesAVX2(uint8 *inBase, const SoftBodySharedSettings::EdgeBatch *inBatch, const SoftBodySharedSettings::EdgeBatch *inEnd, float inInvDtSq)
+{
+	sSolveEdgeBatches(inBase, inBatch, inEnd, inInvDtSq);
+}
+
+static bool sHasAVX2()
+{
+	static const bool has_avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+	return has_avx2;
+}
+#endif
+
 void SoftBodyMotionProperties::ApplyVolumeConstraints(const SoftBodyUpdateContext &inContext, uint inStartIndex, uint inEndIndex)
 {
 	JPH_PROFILE_FUNCTION();
 
-	float inv_dt_sq = 1.0f / Square(inContext.mSubStepDeltaTime);
-
 	// Satisfy volume constraints
-	for (const Volume *v = mSettings->mVolumeConstraints.data() + inStartIndex, *v_end = mSettings->mVolumeConstraints.data() + inEndIndex; v < v_end; ++v)
+	uint8 *base = reinterpret_cast<uint8 *>(mVertices.data());
+	const SoftBodySharedSettings::VolumeBatch *batches = mSettings->mVolumeBatches.data();
+	float inv_dt_sq = 1.0f / Square(inContext.mSubStepDeltaTime);
+#ifdef JPH_SOFT_BODY_AVX2_DISPATCH
+	if (sHasAVX2())
 	{
-		Vertex &v1 = mVertices[v->mVertex[0]];
-		Vertex &v2 = mVertices[v->mVertex[1]];
-		Vertex &v3 = mVertices[v->mVertex[2]];
-		Vertex &v4 = mVertices[v->mVertex[3]];
-
-		Vec3 x1 = v1.mPosition;
-		Vec3 x2 = v2.mPosition;
-		Vec3 x3 = v3.mPosition;
-		Vec3 x4 = v4.mPosition;
-
-		// Calculate constraint equation
-		Vec3 x1x2 = x2 - x1;
-		Vec3 x1x3 = x3 - x1;
-		Vec3 x1x4 = x4 - x1;
-		float c = abs(x1x2.Cross(x1x3).Dot(x1x4)) - v->mSixRestVolume;
-
-		// Calculate gradient of constraint equation
-		Vec3 d1c = (x4 - x2).Cross(x3 - x2);
-		Vec3 d2c = x1x3.Cross(x1x4);
-		Vec3 d3c = x1x4.Cross(x1x2);
-		Vec3 d4c = x1x2.Cross(x1x3);
-
-		// Get masses
-		float w1 = v1.mInvMass;
-		float w2 = v2.mInvMass;
-		float w3 = v3.mInvMass;
-		float w4 = v4.mInvMass;
-
-		// Calculate -lambda
-		float denom = w1 * d1c.LengthSq() + w2 * d2c.LengthSq() + w3 * d3c.LengthSq() + w4 * d4c.LengthSq() + v->mCompliance * inv_dt_sq;
-		if (denom < 1.0e-12f)
-			continue;
-		float minus_lambda = c / denom;
-
-		// Apply correction
-		v1.mPosition = x1 - minus_lambda * w1 * d1c;
-		v2.mPosition = x2 - minus_lambda * w2 * d2c;
-		v3.mPosition = x3 - minus_lambda * w3 * d3c;
-		v4.mPosition = x4 - minus_lambda * w4 * d4c;
+		sSolveVolumeBatchesAVX2(base, batches + inStartIndex, batches + inEndIndex, inv_dt_sq);
+		return;
 	}
+#endif
+	sSolveVolumeBatches(base, batches + inStartIndex, batches + inEndIndex, inv_dt_sq);
 }
 
 void SoftBodyMotionProperties::ApplySkinConstraints(const SoftBodyUpdateContext &inContext, uint inStartIndex, uint inEndIndex)
@@ -648,30 +749,18 @@ void SoftBodyMotionProperties::ApplyEdgeConstraints(const SoftBodyUpdateContext 
 {
 	JPH_PROFILE_FUNCTION();
 
-	float inv_dt_sq = 1.0f / Square(inContext.mSubStepDeltaTime);
-
 	// Satisfy edge constraints
-	for (const Edge *e = mSettings->mEdgeConstraints.data() + inStartIndex, *e_end = mSettings->mEdgeConstraints.data() + inEndIndex; e < e_end; ++e)
+	uint8 *base = reinterpret_cast<uint8 *>(mVertices.data());
+	const SoftBodySharedSettings::EdgeBatch *batches = mSettings->mEdgeBatches.data();
+	float inv_dt_sq = 1.0f / Square(inContext.mSubStepDeltaTime);
+#ifdef JPH_SOFT_BODY_AVX2_DISPATCH
+	if (sHasAVX2())
 	{
-		Vertex &v0 = mVertices[e->mVertex[0]];
-		Vertex &v1 = mVertices[e->mVertex[1]];
-
-		// Get positions
-		Vec3 x0 = v0.mPosition;
-		Vec3 x1 = v1.mPosition;
-
-		// Calculate current length
-		Vec3 delta = x1 - x0;
-		float length = delta.Length();
-
-		// Apply correction
-		float denom = length * (v0.mInvMass + v1.mInvMass + e->mCompliance * inv_dt_sq);
-		if (denom < 1.0e-12f)
-			continue;
-		Vec3 correction = delta * (length - e->mRestLength) / denom;
-		v0.mPosition = x0 + v0.mInvMass * correction;
-		v1.mPosition = x1 - v1.mInvMass * correction;
+		sSolveEdgeBatchesAVX2(base, batches + inStartIndex, batches + inEndIndex, inv_dt_sq);
+		return;
 	}
+#endif
+	sSolveEdgeBatches(base, batches + inStartIndex, batches + inEndIndex, inv_dt_sq);
 }
 
 void SoftBodyMotionProperties::ApplyRodStretchShearConstraints(const SoftBodyUpdateContext &inContext, uint inStartIndex, uint inEndIndex)
@@ -1157,7 +1246,7 @@ void SoftBodyMotionProperties::ProcessGroup(const SoftBodyUpdateContext &ioConte
 	const SoftBodySharedSettings::UpdateGroup &current = mSettings->mUpdateGroups[inGroupIndex];
 
 	// Process volume constraints
-	ApplyVolumeConstraints(ioContext, prev.mVolumeEndIndex, current.mVolumeEndIndex);
+	ApplyVolumeConstraints(ioContext, inGroupIndex > 0? mSettings->mVolumeBatchEnd[inGroupIndex - 1] : 0, mSettings->mVolumeBatchEnd[inGroupIndex]);
 
 	// Process bend constraints
 	ApplyDihedralBendConstraints(ioContext, prev.mDihedralBendEndIndex, current.mDihedralBendEndIndex);
@@ -1166,7 +1255,7 @@ void SoftBodyMotionProperties::ProcessGroup(const SoftBodyUpdateContext &ioConte
 	ApplySkinConstraints(ioContext, prev.mSkinnedEndIndex, current.mSkinnedEndIndex);
 
 	// Process edges
-	ApplyEdgeConstraints(ioContext, prev.mEdgeEndIndex, current.mEdgeEndIndex);
+	ApplyEdgeConstraints(ioContext, inGroupIndex > 0? mSettings->mEdgeBatchEnd[inGroupIndex - 1] : 0, mSettings->mEdgeBatchEnd[inGroupIndex]);
 
 	// Process rods
 	ApplyRodStretchShearConstraints(ioContext, prev.mRodStretchShearEndIndex, current.mRodStretchShearEndIndex);

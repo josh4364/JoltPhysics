@@ -268,13 +268,13 @@ private:
 	/// Enforce all bend constraints
 	void								ApplyDihedralBendConstraints(const SoftBodyUpdateContext &inContext, uint inStartIndex, uint inEndIndex);
 
-	/// Enforce all volume constraints
+	/// Enforce the volume constraints of the batches inStartIndex to inEndIndex of SoftBodySharedSettings::mVolumeBatches, four at a time
 	void								ApplyVolumeConstraints(const SoftBodyUpdateContext &inContext, uint inStartIndex, uint inEndIndex);
 
 	/// Enforce all skin constraints
 	void								ApplySkinConstraints(const SoftBodyUpdateContext &inContext, uint inStartIndex, uint inEndIndex);
 
-	/// Enforce all edge constraints
+	/// Enforce the edge constraints of the batches inStartIndex to inEndIndex of SoftBodySharedSettings::mEdgeBatches, four at a time
 	void								ApplyEdgeConstraints(const SoftBodyUpdateContext &inContext, uint inStartIndex, uint inEndIndex);
 
 	/// Enforce all rod constraints

@@ -6,6 +6,8 @@
 
 #include <Jolt/Physics/SoftBody/SoftBodySharedSettings.h>
 #include <Jolt/Physics/SoftBody/SoftBodyUpdateContext.h>
+#include <Jolt/Physics/Body/BodyID.h>
+#include <Jolt/Physics/SoftBody/SoftBodyVertex.h>
 #include <Jolt/ObjectStream/TypeDeclarations.h>
 #include <Jolt/Core/StreamUtils.h>
 #include <Jolt/Core/QuickSort.h>
@@ -1181,6 +1183,109 @@ void SoftBodySharedSettings::Optimize(OptimizationResults &outResults)
 	// Free closest kinematic buffer
 	mClosestKinematic.clear();
 	mClosestKinematic.shrink_to_fit();
+
+	CalculateConstraintBatches();
+}
+
+void SoftBodySharedSettings::CalculateConstraintBatches()
+{
+	// Packs the constraints of each group into batches of four that share no vertex, keeping the result of the sequential solve:
+	// a constraint joins the batch being filled only when it shares no vertex with the batch nor with any earlier constraint that
+	// still waits. A constraint therefore only moves ahead of constraints that it does not touch, and solving the batches one after
+	// another gives the same positions as solving the constraints in their own order, up to rounding.
+	constexpr uint cWindow = 1024; // Waiting constraints a batch looks at before it closes with fewer than four
+
+	Array<uint32> stamp;
+	stamp.resize(mVertices.size(), 0);
+	uint32 current_stamp = 0;
+	Array<bool> taken;
+
+	// inGetVertices(constraint, out vertices), inEmit(constraints, count)
+	auto pack = [&stamp, &current_stamp, &taken](uint inStart, uint inEnd, uint inNumVertices, const auto &inGetVertices, const auto &inEmit)
+	{
+		taken.clear();
+		taken.resize(inEnd - inStart, false);
+		uint head = 0;
+		for (;;)
+		{
+			while (head < inEnd - inStart && taken[head])
+				++head;
+			if (head >= inEnd - inStart)
+				break;
+
+			++current_stamp;
+			uint batch[4];
+			uint count = 0;
+			uint scanned = 0;
+			for (uint i = head; i < inEnd - inStart && scanned < cWindow && count < 4; ++i)
+			{
+				if (taken[i])
+					continue;
+				++scanned;
+				uint32 v[4];
+				inGetVertices(inStart + i, v);
+				bool free = true;
+				for (uint k = 0; k < inNumVertices; ++k)
+					if (stamp[v[k]] == current_stamp)
+						free = false;
+				for (uint k = 0; k < inNumVertices; ++k)
+					stamp[v[k]] = current_stamp;
+				if (free)
+				{
+					batch[count++] = inStart + i;
+					taken[i] = true;
+				}
+			}
+			inEmit(batch, count);
+		}
+	};
+
+	mEdgeBatches.clear();
+	mEdgeBatchEnd.clear();
+	mVolumeBatches.clear();
+	mVolumeBatchEnd.clear();
+	uint edge_start = 0, volume_start = 0;
+	for (const UpdateGroup &group : mUpdateGroups)
+	{
+		pack(edge_start, group.mEdgeEndIndex, 2,
+			[this](uint inIndex, uint32 *outVertices) { outVertices[0] = mEdgeConstraints[inIndex].mVertex[0]; outVertices[1] = mEdgeConstraints[inIndex].mVertex[1]; },
+			[this](const uint *inConstraints, uint inCount) {
+				// Padding lanes come first and repeat the first constraint, so the lane that holds it writes its vertices last
+				EdgeBatch b;
+				for (uint lane = 0; lane < 4; ++lane)
+				{
+					bool active = lane >= 4 - inCount;
+					const Edge &e = mEdgeConstraints[inConstraints[active? lane - (4 - inCount) : 0]];
+					b.mOffset[0][lane] = e.mVertex[0] * uint32(sizeof(SoftBodyVertex));
+					b.mOffset[1][lane] = e.mVertex[1] * uint32(sizeof(SoftBodyVertex));
+					b.mRestLength[lane] = e.mRestLength;
+					b.mCompliance[lane] = e.mCompliance;
+					b.mActive[lane] = active? 0xffffffff : 0;
+				}
+				mEdgeBatches.push_back(b);
+			});
+		mEdgeBatchEnd.push_back((uint)mEdgeBatches.size());
+		edge_start = group.mEdgeEndIndex;
+
+		pack(volume_start, group.mVolumeEndIndex, 4,
+			[this](uint inIndex, uint32 *outVertices) { for (uint k = 0; k < 4; ++k) outVertices[k] = mVolumeConstraints[inIndex].mVertex[k]; },
+			[this](const uint *inConstraints, uint inCount) {
+				VolumeBatch b;
+				for (uint lane = 0; lane < 4; ++lane)
+				{
+					bool active = lane >= 4 - inCount;
+					const Volume &v = mVolumeConstraints[inConstraints[active? lane - (4 - inCount) : 0]];
+					for (uint k = 0; k < 4; ++k)
+						b.mOffset[k][lane] = v.mVertex[k] * uint32(sizeof(SoftBodyVertex));
+					b.mSixRestVolume[lane] = v.mSixRestVolume;
+					b.mCompliance[lane] = v.mCompliance;
+					b.mActive[lane] = active? 0xffffffff : 0;
+				}
+				mVolumeBatches.push_back(b);
+			});
+		mVolumeBatchEnd.push_back((uint)mVolumeBatches.size());
+		volume_start = group.mVolumeEndIndex;
+	}
 }
 
 Ref<SoftBodySharedSettings> SoftBodySharedSettings::Clone() const
@@ -1199,6 +1304,10 @@ Ref<SoftBodySharedSettings> SoftBodySharedSettings::Clone() const
 	clone->mRodBendTwistConstraints = mRodBendTwistConstraints;
 	clone->mMaterials = mMaterials;
 	clone->mUpdateGroups = mUpdateGroups;
+	clone->mEdgeBatches = mEdgeBatches;
+	clone->mEdgeBatchEnd = mEdgeBatchEnd;
+	clone->mVolumeBatches = mVolumeBatches;
+	clone->mVolumeBatchEnd = mVolumeBatchEnd;
 	return clone;
 }
 
@@ -1267,6 +1376,9 @@ void SoftBodySharedSettings::RestoreBinaryState(StreamIn &inStream)
 		inS.Read(outElement.mJointIndex);
 		inS.Read(outElement.mInvBind);
 	});
+
+	// Derived from the constraints, not stored
+	CalculateConstraintBatches();
 }
 
 void SoftBodySharedSettings::SaveWithMaterials(StreamOut &inStream, SharedSettingsToIDMap &ioSettingsMap, MaterialToIDMap &ioMaterialMap) const
