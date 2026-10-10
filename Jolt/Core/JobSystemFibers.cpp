@@ -144,10 +144,7 @@ void JobSystemFibers::WaitForJobs(Barrier *inBarrier)
 void JobSystemFibers::sRun(void *inJob)
 {
 	Job *job = static_cast<Job *>(inJob);
-	core_profile_zone_t zone;
-	core_profile_zone_open(&zone, job->GetName(), CORE_PROFILE_KIND_ZONE);
 	job->Execute();
-	core_profile_zone_close(&zone);
 	// The reference QueueJob took
 	job->Release();
 }
@@ -155,7 +152,7 @@ void JobSystemFibers::sRun(void *inJob)
 void JobSystemFibers::QueueJob(Job *inJob)
 {
 	inJob->AddRef();
-	if (core_fiber_dispatch(mFibers, sRun, inJob, CORE_FIBER_PRIORITY_HIGH, "JoltJob", nullptr))
+	if (core_fiber_dispatch(mFibers, sRun, inJob, CORE_FIBER_PRIORITY_HIGH, inJob->GetName(), nullptr))
 		return;
 
 	// Every cell of the HIGH queue is taken. The job must run, or its barrier
