@@ -127,6 +127,10 @@ struct PhysicsSettings
 	/// solver iteration of a body) queues helper jobs for it.
 	int			mMaxSoftBodySimulateJobs = 0;
 
+	/// Microseconds a SoftBodySimulate job works before it gives its thread back to a new job at the back of the queue, when work is
+	/// left; 0 or less for no limit. A job system without preemption runs nothing else on the thread while a job works.
+	int			mSoftBodySimulateJobBudgetUs = 200;
+
 	///@}
 };
 

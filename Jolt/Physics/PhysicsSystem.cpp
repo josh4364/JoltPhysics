@@ -33,6 +33,10 @@
 #include <Jolt/Core/TempAllocator.h>
 #include <Jolt/Core/QuickSort.h>
 #include <Jolt/Core/ScopeExit.h>
+
+JPH_SUPPRESS_WARNINGS_STD_BEGIN
+#include <chrono>
+JPH_SUPPRESS_WARNINGS_STD_END
 #ifdef JPH_DEBUG_RENDERER
 	#include <Jolt/Renderer/DebugRenderer.h>
 #endif // JPH_DEBUG_RENDERER
@@ -2782,10 +2786,15 @@ void PhysicsSystem::QueueSoftBodySimulateHelpers(PhysicsUpdateContext *ioContext
 	}
 	while (!ioContext->mSoftBodySimulateJobs.compare_exchange_weak(running, running + num_helpers, memory_order_acq_rel, memory_order_relaxed));
 
-	// The calling job still holds its own dependency on the finalize job, so the finalize job cannot have started
-	ioStep->mSoftBodyFinalize.AddDependency(num_helpers);
+	QueueSoftBodySimulateJobs(ioContext, ioStep, inBody, num_helpers);
+}
 
-	for (int i = 0; i < num_helpers; ++i)
+void PhysicsSystem::QueueSoftBodySimulateJobs(PhysicsUpdateContext *ioContext, PhysicsUpdateContext::Step *ioStep, uint inBody, int inNumJobs) const
+{
+	// The calling job still holds its own dependency on the finalize job, so the finalize job cannot have started
+	ioStep->mSoftBodyFinalize.AddDependency(inNumJobs);
+
+	for (int i = 0; i < inNumJobs; ++i)
 	{
 		JobHandle helper = ioContext->mJobSystem->CreateJob("SoftBodySimulate", cColorSoftBodySimulate, [ioContext, ioStep, inBody]()
 			{
@@ -2828,6 +2837,10 @@ void PhysicsSystem::JobSoftBodySimulate(PhysicsUpdateContext *ioContext, Physics
 	uint num_soft_bodies = ioContext->mNumSoftBodies;
 	uint start_idx = inFirstBody % num_soft_bodies;
 
+	// The job gives its thread back after its budget: a job system without preemption runs nothing else on the thread meanwhile.
+	const int budget_us = mPhysicsSettings.mSoftBodySimulateJobBudgetUs;
+	const std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
+
 	// Take batches of work until a full pass over the bodies finds none. The job then returns instead of waiting for the batches that
 	// other jobs still work on: the job that finishes a phase of a body opens the next one and queues helpers for it.
 	for (;;)
@@ -2847,6 +2860,16 @@ void PhysicsSystem::JobSoftBodySimulate(PhysicsUpdateContext *ioContext, Physics
 				uint available = sb_ctx.mMotionProperties->GetNumParallelBatchesAvailable(sb_ctx);
 				if (available > 1)
 					QueueSoftBodySimulateHelpers(ioContext, ioStep, sb_idx, available);
+
+				// Over budget with work left: a new job takes this job's place in mSoftBodySimulateJobs and goes to the back of
+				// the queue, so the jobs queued meanwhile (the frame's other HIGH work) run first on this thread (T691)
+				if (budget_us > 0
+					&& std::chrono::steady_clock::now() - start_time >= std::chrono::microseconds(budget_us)
+					&& GetNumSoftBodyBatchesAvailable(ioContext) > 0)
+				{
+					QueueSoftBodySimulateJobs(ioContext, ioStep, sb_idx, 1);
+					return;
+				}
 			}
 		}
 		if (did_work)

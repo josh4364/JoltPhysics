@@ -903,6 +903,8 @@ void SoftBodyMotionProperties::ApplyCollisionConstraintsAndUpdateVelocities(cons
 
 void SoftBodyMotionProperties::FinishVelocities(const SoftBodyUpdateContext &inContext)
 {
+	JPH_PROFILE("SB FinishVelocities");
+
 	// The impulses of the batches on the dynamic bodies, in batch order so that the sum does not depend on which thread ran which batch
 	if (mHasDynamicCollidingShape)
 	{
@@ -1073,6 +1075,8 @@ void SoftBodyMotionProperties::InitializeUpdateContext(float inDeltaTime, Body &
 
 void SoftBodyMotionProperties::StartNextIteration(const SoftBodyUpdateContext &ioContext)
 {
+	JPH_PROFILE("SB StartIteration");
+
 	ApplyPressure(ioContext);
 
 	IntegratePositions(ioContext, 0, (uint)mVertices.size());
@@ -1101,7 +1105,10 @@ SoftBodyMotionProperties::EStatus SoftBodyMotionProperties::ParallelDetermineCol
 		{
 			// Process collision planes
 			uint num_vertices_to_process = min(SoftBodyUpdateContext::cVertexCollisionBatch, num_vertices - next_vertex);
-			DetermineCollisionPlanes(ioContext, next_vertex, num_vertices_to_process);
+			{
+				JPH_PROFILE("SB CollisionPlanes");
+				DetermineCollisionPlanes(ioContext, next_vertex, num_vertices_to_process);
+			}
 			uint vertices_processed = ioContext.mNumCollisionVerticesProcessed.fetch_add(SoftBodyUpdateContext::cVertexCollisionBatch, memory_order_acq_rel) + num_vertices_to_process;
 			if (vertices_processed >= num_vertices)
 			{
@@ -1128,6 +1135,7 @@ SoftBodyMotionProperties::EStatus SoftBodyMotionProperties::ParallelDetermineSen
 		if (sensor_index < mNumSensors)
 		{
 			// Process this sensor
+			JPH_PROFILE("SB SensorCollisions");
 			DetermineSensorCollisions(mCollidingSensors[sensor_index]);
 
 			// Determine next state
@@ -1186,7 +1194,10 @@ SoftBodyMotionProperties::EStatus SoftBodyMotionProperties::ParallelApplyConstra
 			if (num_groups > 0)
 			{
 				// Process this group
-				ProcessGroup(ioContext, next_group);
+				{
+					JPH_PROFILE("SB ConstraintGroup");
+					ProcessGroup(ioContext, next_group);
+				}
 
 				// Increment total number of groups processed
 				num_groups_processed = ioContext.mNumConstraintGroupsProcessed.fetch_add(1, memory_order_acq_rel) + 1;
@@ -1198,7 +1209,10 @@ SoftBodyMotionProperties::EStatus SoftBodyMotionProperties::ParallelApplyConstra
 				JPH_PROFILE("FinishIteration");
 
 				// Process non-parallel group
-				ProcessGroup(ioContext, num_groups);
+				{
+					JPH_PROFILE("SB SerialGroup");
+					ProcessGroup(ioContext, num_groups);
+				}
 
 				// The collision constraints and the velocities go to batches of vertices, each with its own row of velocity deltas
 				if (mHasDynamicCollidingShape)
@@ -1231,7 +1245,10 @@ SoftBodyMotionProperties::EStatus SoftBodyMotionProperties::ParallelUpdateVeloci
 	if (batch >= num_batches)
 		return EStatus::NoWork;
 
-	ApplyCollisionConstraintsAndUpdateVelocities(ioContext, batch);
+	{
+		JPH_PROFILE("SB VelocityBatch");
+		ApplyCollisionConstraintsAndUpdateVelocities(ioContext, batch);
+	}
 
 	// With no pressure the next iteration integrates each vertex on its own, so the batch does it now. Pressure needs the volume of the whole body first.
 	bool integrate_here = ioContext.mNextIteration.load(memory_order_relaxed) < mNumIterations && mPressure <= 0.0f;

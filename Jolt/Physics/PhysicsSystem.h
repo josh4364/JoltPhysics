@@ -288,6 +288,7 @@ private:
 	void						JobSoftBodyCollide(PhysicsUpdateContext *ioContext) const;
 	void						JobSoftBodySimulate(PhysicsUpdateContext *ioContext, PhysicsUpdateContext::Step *ioStep, uint inFirstBody) const;
 	void						QueueSoftBodySimulateHelpers(PhysicsUpdateContext *ioContext, PhysicsUpdateContext::Step *ioStep, uint inBody, uint inAvailable) const;
+	void						QueueSoftBodySimulateJobs(PhysicsUpdateContext *ioContext, PhysicsUpdateContext::Step *ioStep, uint inBody, int inNumJobs) const;
 	uint						GetNumSoftBodyBatchesAvailable(const PhysicsUpdateContext *inContext) const;
 	void						JobSoftBodyFinalize(PhysicsUpdateContext *ioContext);
 
