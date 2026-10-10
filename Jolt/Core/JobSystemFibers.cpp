@@ -160,7 +160,11 @@ void JobSystemFibers::QueueJob(Job *inJob)
 	// each job that a job's end makes ready.
 	if (!mReportedInlineJobs.exchange(true))
 		LOG_WARNING("Physics", "The fiber HIGH queue is full: Jolt jobs run inline");
+	// No slice carries the name here, so a zone does
+	core_profile_zone_t zone;
+	core_profile_zone_open(&zone, inJob->GetName(), CORE_PROFILE_KIND_ZONE);
 	sRun(inJob);
+	core_profile_zone_close(&zone);
 }
 
 void JobSystemFibers::QueueJobs(Job **inJobs, uint inNumJobs)
