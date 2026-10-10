@@ -625,7 +625,18 @@ EPhysicsUpdateError PhysicsSystem::Update(float inDeltaTime, int inCollisionStep
 	// would be scheduled in between there is the possibility of a deadlock.
 	// The other job could try to e.g. add/remove a body which would try to
 	// lock a body mutex while this thread has already locked the mutex
+#if defined(JPH_SERENITY_FIBERS) && defined(JPH_ENABLE_ASSERTS)
+	// The wait parks this fiber, and it can resume on another thread (T690).
+	// The assert record of the locks this update holds is per thread: it
+	// leaves this thread before the wait, so the jobs that run on it start
+	// clean, and comes back on the thread that resumes the update.
+	const PhysicsLock::ThreadLocks saved_locks = PhysicsLock::sThreadLocks();
+	PhysicsLock::sThreadLocks() = { };
 	inJobSystem->WaitForJobs(barrier);
+	PhysicsLock::sThreadLocks() = saved_locks;
+#else
+	inJobSystem->WaitForJobs(barrier);
+#endif
 
 	// We're done with the barrier for this update
 	inJobSystem->DestroyBarrier(barrier);
@@ -1547,7 +1558,13 @@ void PhysicsSystem::JobSolveVelocityConstraints(PhysicsUpdateContext *ioContext,
 		else if (check_split_islands)
 		{
 			// If there are split islands, but we didn't do any work, give up a time slice
+		#ifdef JPH_SERENITY_FIBERS
+			// A fiber worker pinned to its core: sched_yield hands the core to
+			// whatever else runs on the machine for a whole slice (T690)
+			SerenityLock::sPause();
+		#else
 			std::this_thread::yield();
+		#endif
 		}
 		else
 		{
@@ -2633,7 +2650,13 @@ void PhysicsSystem::JobSolvePositionConstraints(PhysicsUpdateContext *ioContext,
 		else if (check_split_islands)
 		{
 			// If there are split islands, but we didn't do any work, give up a time slice
+		#ifdef JPH_SERENITY_FIBERS
+			// A fiber worker pinned to its core: sched_yield hands the core to
+			// whatever else runs on the machine for a whole slice (T690)
+			SerenityLock::sPause();
+		#else
 			std::this_thread::yield();
+		#endif
 		}
 		else
 		{

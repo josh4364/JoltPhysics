@@ -587,6 +587,17 @@ static_assert(sizeof(uint64) == 8, "Invalid size of uint64");
 	#error Undefined
 #endif
 
+// Never inline: a function that reads a thread_local for a caller that can
+// change thread in between (a fiber that parks, T690)
+#if defined(JPH_COMPILER_MSVC)
+	#define JPH_NO_INLINE __declspec(noinline)
+#elif defined(JPH_COMPILER_GCC)
+	// noipa: GCC may also find the function const and merge two calls
+	#define JPH_NO_INLINE __attribute__((noipa))
+#else
+	#define JPH_NO_INLINE __attribute__((noinline))
+#endif
+
 // Default memory allocation alignment.
 // This define can be overridden in case the user provides an Allocate function that has a different alignment than the platform default.
 #ifndef JPH_DEFAULT_ALLOCATE_ALIGNMENT

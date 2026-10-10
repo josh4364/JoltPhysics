@@ -79,33 +79,48 @@ public:
 	}
 
 #ifdef JPH_ENABLE_ASSERTS
-private:
 	struct LockData
 	{
 		uint32					mLockedMutexes = 0;
 		PhysicsLockContext		mContext = nullptr;
 	};
 
+	/// The locks one thread holds, for every physics system
+	struct ThreadLocks
+	{
+		LockData				mLocks[4];
+	};
+
+	/// The record of the locks this thread holds. A wait that can resume on
+	/// another thread (a fiber) moves it out before and back in after. Never
+	/// inlined: an inlined thread_local address can be reused across the wait.
+	JPH_NO_INLINE static ThreadLocks &	sThreadLocks()
+	{
+		static thread_local ThreadLocks sLocks;
+		return sLocks;
+	}
+
+private:
 	// Helper function to find the locked mutexes for a particular context
 	static uint32 &				sGetLockedMutexes(PhysicsLockContext inContext)
 	{
-		static thread_local LockData sLocks[4];
+		LockData *locks = sThreadLocks().mLocks;
 
 		// If we find a matching context we can use it
-		for (LockData &l : sLocks)
-			if (l.mContext == inContext)
-				return l.mLockedMutexes;
+		for (LockData *l = locks; l < locks + 4; ++l)
+			if (l->mContext == inContext)
+				return l->mLockedMutexes;
 
 		// Otherwise we look for an entry that is not in use
-		for (LockData &l : sLocks)
-			if (l.mLockedMutexes == 0)
+		for (LockData *l = locks; l < locks + 4; ++l)
+			if (l->mLockedMutexes == 0)
 			{
-				l.mContext = inContext;
-				return l.mLockedMutexes;
+				l->mContext = inContext;
+				return l->mLockedMutexes;
 			}
 
 		JPH_ASSERT(false, "Too many physics systems locked at the same time!");
-		return sLocks[0].mLockedMutexes;
+		return locks[0].mLockedMutexes;
 	}
 #endif // !JPH_ENABLE_ASSERTS
 };

@@ -10,6 +10,7 @@
 #include <Jolt/Core/NonCopyable.h>
 #include <Jolt/Core/StaticArray.h>
 #include <Jolt/Core/Atomics.h>
+#include <Jolt/Core/InplaceFunction.h>
 
 JPH_NAMESPACE_BEGIN
 
@@ -144,7 +145,7 @@ public:
 	};
 
 	/// Main function of the job
-	using JobFunction = function<void()>;
+	using JobFunction = InplaceFunction<64>;
 
 	/// Destructor
 	virtual					~JobSystem() = default;
@@ -174,8 +175,8 @@ protected:
 
 		/// Constructor
 							Job([[maybe_unused]] const char *inJobName, [[maybe_unused]] ColorArg inColor, JobSystem *inJobSystem, const JobFunction &inJobFunction, uint32 inNumDependencies) :
-		#if defined(JPH_EXTERNAL_PROFILE) || defined(JPH_PROFILE_ENABLED)
 			mJobName(inJobName),
+		#if defined(JPH_EXTERNAL_PROFILE) || defined(JPH_PROFILE_ENABLED)
 			mColor(inColor),
 		#endif // defined(JPH_EXTERNAL_PROFILE) || defined(JPH_PROFILE_ENABLED)
 			mJobSystem(inJobSystem),
@@ -272,10 +273,8 @@ protected:
 		/// Test if the job finished executing
 		inline bool			IsDone() const								{ return mNumDependencies.load(memory_order_relaxed) == cDoneState; }
 
-	#if defined(JPH_EXTERNAL_PROFILE) || defined(JPH_PROFILE_ENABLED)
-		/// Get the name of the job
+		/// Get the name of the job (kept in every build: Serenity's fiber job system names its profile zones with it)
 		const char *		GetName() const								{ return mJobName; }
-	#endif // defined(JPH_EXTERNAL_PROFILE) || defined(JPH_PROFILE_ENABLED)
 
 		static constexpr uint32 cExecutingState = 0xe0e0e0e0;			///< Value of mNumDependencies when job is executing
 		static constexpr uint32 cDoneState		= 0xd0d0d0d0;			///< Value of mNumDependencies when job is done executing
@@ -283,8 +282,8 @@ protected:
 		static constexpr intptr_t cBarrierDoneState = ~intptr_t(0);		///< Value to use when the barrier has been triggered
 
 private:
-	#if defined(JPH_EXTERNAL_PROFILE) || defined(JPH_PROFILE_ENABLED)
 		const char *		mJobName;									///< Name of the job
+	#if defined(JPH_EXTERNAL_PROFILE) || defined(JPH_PROFILE_ENABLED)
 		Color				mColor;										///< Color of the job in the profiler
 	#endif // defined(JPH_EXTERNAL_PROFILE) || defined(JPH_PROFILE_ENABLED)
 		JobSystem *			mJobSystem;									///< The job system we belong to
