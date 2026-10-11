@@ -13,6 +13,12 @@ JPH_SUPPRESS_WARNINGS_STD_BEGIN
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
+#if defined(JPH_SERENITY_FIBERS) && (defined(JPH_PLATFORM_LINUX) || defined(JPH_PLATFORM_ANDROID))
+	#include <climits>
+	#include <linux/futex.h>
+	#include <sys/syscall.h>
+	#include <unistd.h>
+#endif
 JPH_SUPPRESS_WARNINGS_STD_END
 
 JPH_NAMESPACE_BEGIN
@@ -115,8 +121,9 @@ private:
 // fiber, which can resume on another thread, so a lock here has no owning
 // thread: any thread may unlock it. glibc's pthread_rwlock_unlock cannot do
 // that (it takes a write unlock only on the locking thread). The state is one
-// atomic word; a contended lock spins briefly and then sleeps on the word
-// (C++20 atomic wait: a futex on Linux, WaitOnAddress on Windows).
+// atomic word; a contended lock spins briefly and then sleeps on the word: a
+// futex on Linux and Android, C++20 atomic wait elsewhere. The Steam build's
+// libstdc++ 10 (Sniper) has no atomic wait, so Linux calls the futex itself.
 
 /// Bits of the lock word shared by MutexBase and SharedMutexBase
 namespace SerenityLock
@@ -141,14 +148,25 @@ namespace SerenityLock
 	{
 		if ((inSeen & cWaiters) == 0 && !ioWord.compare_exchange_strong(inSeen, inSeen | cWaiters, memory_order_relaxed))
 			return;
+	#if defined(JPH_PLATFORM_LINUX) || defined(JPH_PLATFORM_ANDROID)
+		static_assert(sizeof(atomic<uint32>) == sizeof(uint32), "The futex reads the word in place");
+		syscall(SYS_futex, reinterpret_cast<uint32 *>(&ioWord), FUTEX_WAIT_PRIVATE, inSeen | cWaiters, nullptr, nullptr, 0);
+	#else
 		ioWord.wait(inSeen | cWaiters, memory_order_relaxed);
+	#endif
 	}
 
 	/// Clears the waiters bit and wakes every sleeper when the bit was set in @p inOld
 	JPH_INLINE void		sWake(atomic<uint32> &ioWord, uint32 inOld)
 	{
 		if (inOld & cWaiters)
+		{
+		#if defined(JPH_PLATFORM_LINUX) || defined(JPH_PLATFORM_ANDROID)
+			syscall(SYS_futex, reinterpret_cast<uint32 *>(&ioWord), FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+		#else
 			ioWord.notify_all();
+		#endif
+		}
 	}
 }
 
